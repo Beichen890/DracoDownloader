@@ -1,0 +1,11 @@
+LICENSE
+NOTICE.md
+README.md
+pyproject.toml
+draco_downloader.egg-info/PKG-INFO
+draco_downloader.egg-info/SOURCES.txt
+draco_downloader.egg-info/dependency_links.txt
+draco_downloader.egg-info/entry_points.txt
+draco_downloader.egg-info/requires.txt
+draco_downloader.egg-info/top_level.txt
+tests/test_draco.py

@@ -1,0 +1,262 @@
+"""
+HTTP/HTTPS 协议驱动
+"""
+
+import asyncio
+import aiohttp
+import os
+import math
+import json
+import time
+import re
+from pathlib import Path
+from typing import Optional, Dict, Any, Callable
+
+from .base import ProtocolDriver, DownloadHandle
+
+
+# === 常量定义 ===
+_DEFAULT_MAX_CONNECTIONS = 64
+_DEFAULT_CHUNK_SIZE = 1024 * 1024        # 1 MiB
+_HTTP_TIMEOUT_TOTAL = 300                 # 5 min
+_HTTP_TIMEOUT_CONNECT = 30                # 30 s
+_MERGE_BUFFER_SIZE = 16 * 1024 * 1024     # 16 MiB 合并缓冲区
+_CHUNK_RETRIES = 5                        # 分片下载最大重试次数
+_CHUNK_RETRY_BACKOFF = 2                  # 重试退避指数基数
+_SINGLE_FILE_THRESHOLD_FACTOR = 2         # 单线程阈值 = chunk_size * 2
+
+
+class HTTPDriver(ProtocolDriver):
+    """HTTP/HTTPS 下载驱动 - 异步多分片"""
+    
+    def __init__(self, max_connections: int = _DEFAULT_MAX_CONNECTIONS,
+                 chunk_size: int = _DEFAULT_CHUNK_SIZE):
+        self.max_connections = max_connections
+        self.chunk_size = chunk_size
+        self.timeout = aiohttp.ClientTimeout(
+            total=_HTTP_TIMEOUT_TOTAL,
+            connect=_HTTP_TIMEOUT_CONNECT
+        )
+    
+    def match(self, url: str) -> bool:
+        return url.startswith(("http://", "https://"))
+    
+    async def probe(self, url: str) -> Dict[str, Any]:
+        """探测文件信息 (HEAD 请求)"""
+        async with aiohttp.ClientSession(timeout=self.timeout) as session:
+            async with session.head(url) as resp:
+                if resp.status not in (200, 302, 301):
+                    if resp.status == 404:
+                        raise FileNotFoundError(f"HTTP 404: {url}")
+                    raise ConnectionError(f"HTTP {resp.status} for {url}")
+                
+                size = int(resp.headers.get('content-length', 0))
+                accepts_ranges = resp.headers.get('accept-ranges', '') == 'bytes'
+                content_type = resp.headers.get('content-type', '')
+                filename = self._extract_filename(url, resp.headers)
+            
+            # 如果大小未知，尝试 Range 探测
+            if size == 0:
+                async with session.get(url, headers={'Range': 'bytes=0-1'}) as resp:
+                    if resp.status == 206:
+                        size = self._parse_content_range(resp.headers.get('content-range', ''))
+                        accepts_ranges = True
+            
+            return {
+                'size': size,
+                'supports_range': accepts_ranges,
+                'filename': filename,
+                'content_type': content_type,
+                'url': url
+            }
+    
+    async def download(self, handle: DownloadHandle,
+                       callback: Optional[Callable[[int, int, int], None]] = None):
+        """执行下载"""
+        output_path = Path(handle.output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        total_size = handle.total_size
+        supports_range = handle.metadata.get('supports_range', False)
+        
+        # 检查是否已完整下载
+        if output_path.exists() and output_path.stat().st_size == total_size and total_size > 0:
+            if callback:
+                callback(total_size, total_size, 0)
+            return
+        
+        # 不支持 Range 或文件太小 → 单线程
+        if total_size <= 0 or not supports_range or total_size < self.chunk_size * _SINGLE_FILE_THRESHOLD_FACTOR:
+            await self._download_single(handle, callback)
+            return
+        
+        # 多分片并发下载
+        chunk_count = self._calculate_chunks(total_size)
+        chunk_size = math.ceil(total_size / chunk_count)
+        
+        # 加载进度
+        progress_file = Path(f"{output_path}.progress")
+        chunks_done = self._load_progress(progress_file, chunk_count)
+        
+        # 创建临时目录
+        temp_dir = output_path.parent / f".{output_path.name}.parts"
+        temp_dir.mkdir(exist_ok=True)
+        
+        # 并发下载
+        async with aiohttp.ClientSession(timeout=self.timeout) as session:
+            semaphore = asyncio.Semaphore(self.max_connections)
+            tasks = []
+            completed = sum(1 for d in chunks_done if d)
+            
+            for i in range(chunk_count):
+                if chunks_done[i]:
+                    continue
+                start = i * chunk_size
+                end = min(start + chunk_size - 1, total_size - 1)
+                tasks.append(self._download_chunk(
+                    handle.url, start, end, temp_dir, i,
+                    semaphore, session, callback, total_size
+                ))
+            
+            if tasks:
+                await asyncio.gather(*tasks)
+        
+        # 更新进度
+        completed = 0
+        for i in range(chunk_count):
+            chunk_file = temp_dir / f"part_{i:08d}"
+            if chunk_file.exists():
+                completed += 1
+        
+        # 合并分片
+        if completed == chunk_count:
+            await self._merge_chunks(temp_dir, output_path, chunk_count)
+            progress_file.unlink(missing_ok=True)
+            # 清理临时目录
+            try:
+                temp_dir.rmdir()
+            except OSError:
+                pass
+            if callback:
+                callback(total_size, total_size, 0)
+        else:
+            # 保存进度
+            self._save_progress(progress_file, [
+                chunk_file.exists() for chunk_file in temp_dir.glob("part_*")
+            ])
+    
+    async def _download_chunk(self, url: str, start: int, end: int,
+                              temp_dir: Path, idx: int,
+                              semaphore: asyncio.Semaphore,
+                              session: aiohttp.ClientSession,
+                              callback: Optional[Callable],
+                              total_size: int):
+        """下载单个分片"""
+        chunk_file = temp_dir / f"part_{idx:08d}"
+        
+        # 检查是否已下载
+        if chunk_file.exists() and chunk_file.stat().st_size >= (end - start + 1):
+            return
+        
+        for attempt in range(_CHUNK_RETRIES):
+            try:
+                async with semaphore:
+                    headers = {'Range': f'bytes={start}-{end}'}
+                    async with session.get(url, headers=headers) as resp:
+                        if resp.status not in (200, 206):
+                            if resp.status == 416:
+                                # Range not satisfiable → 已完整下载
+                                return
+                            raise RuntimeError(f"HTTP {resp.status}")
+                        
+                        with open(chunk_file, 'wb') as f:
+                            async for data in resp.content.iter_chunked(self.chunk_size):
+                                f.write(data)
+                                if callback:
+                                    # 计算已下载总量 (近似)
+                                    downloaded = sum(
+                                        f.stat().st_size for f in temp_dir.glob("part_*")
+                                    )
+                                    callback(downloaded, total_size, 0)
+                return
+            except Exception as e:
+                if attempt == _CHUNK_RETRIES - 1:
+                    raise
+                await asyncio.sleep(2 ** attempt)
+    
+    async def _download_single(self, handle: DownloadHandle,
+                               callback: Optional[Callable[[int, int, int], None]] = None):
+        """单线程下载"""
+        output_path = Path(handle.output_path)
+        total_size = handle.total_size
+        
+        async with aiohttp.ClientSession(timeout=self.timeout) as session:
+            async with session.get(handle.url) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"HTTP {resp.status}")
+                
+                downloaded = 0
+                with open(output_path, 'wb') as f:
+                    async for data in resp.content.iter_chunked(self.chunk_size):
+                        f.write(data)
+                        downloaded += len(data)
+                        if callback:
+                            callback(downloaded, total_size or downloaded, 0)
+    
+    async def resume(self, handle: DownloadHandle,
+                     callback: Optional[Callable[[int, int, int], None]] = None):
+        """断点续传"""
+        await self.download(handle, callback)
+    
+    async def _merge_chunks(self, temp_dir: Path, output_path: Path, count: int):
+        """合并分片"""
+        with open(output_path, 'wb') as out:
+            for i in range(count):
+                chunk_file = temp_dir / f"part_{i:08d}"
+                if chunk_file.exists() and chunk_file.stat().st_size > 0:
+                    with open(chunk_file, 'rb') as f:
+                        while True:
+                            data = f.read(16 * 1024 * 1024)
+                            if not data:
+                                break
+                            out.write(data)
+                    chunk_file.unlink()
+    
+    def _calculate_chunks(self, total_size: int) -> int:
+        """动态计算分片数"""
+        if total_size < 10 * 1024 * 1024:
+            return 4
+        if total_size < 100 * 1024 * 1024:
+            return 8
+        if total_size < 500 * 1024 * 1024:
+            return 16
+        if total_size < 2 * 1024 * 1024 * 1024:
+            return 32
+        return 64
+    
+    def _load_progress(self, path: Path, count: int) -> list[bool]:
+        if not path.exists():
+            return [False] * count
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            return data.get('done', [False] * count)
+        except (json.JSONDecodeError, FileNotFoundError, OSError):
+            return [False] * count
+
+    def _save_progress(self, path: Path, done: list):
+        with open(path, 'w') as f:
+            json.dump({'done': done, 'updated': time.time()}, f)
+    
+    def _extract_filename(self, url: str, headers) -> str:
+        cd = headers.get('content-disposition', '')
+        if 'filename=' in cd:
+            match = re.search(r'filename=([^;]+)', cd)
+            if match:
+                return match.group(1).strip('"\'')
+        return url.split('/')[-1].split('?')[0] or 'download'
+    
+    def _parse_content_range(self, cr: str) -> int:
+        if '/' in cr:
+            return int(cr.split('/')[-1])
+        return 0

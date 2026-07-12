@@ -1,0 +1,2 @@
+[console_scripts]
+draco-download = DracoDownloader.cli:main

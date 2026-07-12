@@ -1,0 +1,33 @@
+# DracoDownloader 依赖
+# 轻量化，无 GPL 依赖
+# 安装: pip install -r requirements.txt
+
+# === 核心协议依赖 ===
+
+# HTTP/HTTPS 协议 - 异步多分片并发下载
+aiohttp>=3.9.0,<4
+
+# FTP/FTPS 协议
+aioftp>=0.20.0,<0.21
+
+# === 可选功能依赖 ===
+
+# M3U8 AES-128 解密支持（使用 Crypto.Cipher 模块）
+# 无此依赖时，加密的 HLS 流会提示安装
+pycryptodome>=3.20,<4
+
+# === 自研协议（无外部依赖） ===
+#
+# BT BitTorrent: 完全自研，无外部依赖
+#   - bittorrent/bencode.py    BEP 3 编解码
+#   - bittorrent/dht.py        Kademlia DHT 网络（引导节点可通过 DRACO_DHT_BOOTSTRAP_NODES 配置）
+#   - bittorrent/peer.py       Peer Wire Protocol（支持稀缺分片优先）
+#   - bittorrent/downloader.py 完整下载器（支持磁力链接和 .torrent 文件）
+#   - bittorrent/magnet.py     磁力链接解析器
+#
+# 无需 aria2, libtorrent, FFmpeg 等 GPL 依赖
+
+# === 测试依赖 ===
+# pytest>=7.0
+# pytest-asyncio>=0.23
+# aiofiles>=23.0
