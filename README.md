@@ -4,19 +4,26 @@
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![PyPI version](https://img.shields.io/pypi/v/draco-downloader)](https://pypi.org/project/draco-downloader/)
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
-[![GitHub Stars](https://img.shields.io/github/stars/Beichen890/DracoDownloader?style=social)](https://github.com/Beichen890/DracoDownloader)
+**Agent专用 Python 多协议下载器** — 无 GPL 依赖，支持 HTTP/HTTPS、FTP/FTPS、M3U8/HLS、BitTorrent / 磁力链接,AI时代的自动挡下载器！
+> ⭐ **如果这个项目对你有帮助，欢迎点 Star 支持！**  
+> Star 是开发者最大的动力，也是帮助更多人发现这个项目的最好方式 🙏
+>
+> ## 🌟 为什么选择 DracoDownloader？
 
-[![Star us on GitHub](https://img.shields.io/badge/⭐%20Star%20us%20on%20GitHub-181717?style=for-the-badge&logo=github&logoColor=white)](https://github.com/Beichen890/DracoDownloader)
+> 你还在为下载 Python 包花费 8 美元而心痛吗？  
+> 你还在为网络不通而烦恼吗？  
+> 你还在为 OpenClaw 无休止的重试而支付巨额账单吗？  
+> ** DracoDownloader —— 让 AI Agent 拥有属于自己的下载能力！**
 
-**纯自研 Python 多协议下载器** — 无 GPL 依赖，支持 HTTP/HTTPS、FTP/FTPS、M3U8/HLS、BitTorrent / 磁力链接。
-**AI时代的自动档下载器！！！**  
-🔴 **你还在为下载 python 而花费 8 美元吗？**  
-🔴 **你还在为网络不通而烦恼吗？**  
-🔴 **你还在为 Openclaw 不停重试而支付吗？**
+| 特性 | DracoDownloader | 传统方案 (aria2/FFmpeg) |
+|------|----------------|------------------------|
+| **GPL 依赖** | ✅ **零** GPL 依赖 | ❌ 依赖 GPL 库 |
+| **许可证** | ⚖️ MIT 宽松许可 | ⚠️ GPL 传染性 |
+| **部署方式** | 📦 `pip install` 即用 | 🔧 需额外安装二进制 |
+| **AI 集成** | 🤖 原生 async/await | 🔄 需进程包装 |
+| **自研协议** | 🧬 完全自主可控 | 📚 依赖第三方实现 |
 
-> **对比传统方案**：wget/curl 单线程慢如蜗牛，aria2 配置繁琐不支持 BT 磁力，Openclaw 每次重试都在烧钱。
 > **DracoDownloader**：多协议一键下载 + 自动镜像加速 + 智能分片并发，Agent 调用的最佳选择，省时省钱省心！
-
 > v1.2.0 重磅更新：**自动最优镜像站选择** + **动态分片/线程数优化**，下载速度大幅提升！
 
 ---
@@ -297,9 +304,15 @@ python -m pytest tests/ -v -k "TestProtocolRouter"
 ---
 
 ## 关于
-
 DracoDownloader 是 DracoHub 项目的一部分，专为 Agent 原生下载场景设计。
 使用纯 Python 实现，在所有主流操作系统上均可运行。
+
+## ⭐ 支持这个项目
+如果你觉得 DracoDownloader 有用，欢迎：
+- ⭐ **点 Star** — 让更多人发现这个项目
+- 🍴 **Fork** — 参与改进
+- 🐛 **提 Issue** — 反馈问题
+- 💬 **分享** — 推荐给需要的朋友
 
 v1.2.0 新增特性：
 - 🪞 **自动最优镜像站选择** — 内置 12+ 镜像节点，自动选最快的
@@ -307,11 +320,10 @@ v1.2.0 新增特性：
 - 📊 **--dry-run 预分析模式** — 下载前先看最优参数
 - ⏱️ **带宽延迟积 (BDP) 优化算法** — 科学计算并发度
 
-> 如果 DracoDownloader 对你有帮助，欢迎请我喝杯咖啡 ☕
-> 
-> [![爱发电](https://img.shields.io/badge/❤️%20爱发电-beichen890-946CE6?style=for-the-badge&logo=githubsponsors&logoColor=white)](https://afdian.com/a/beichen890)
+-  ## ☕ 支持这个项目
+[![爱发电](https://img.shields.io/badge/爱发电-支持我-FF6B6B?style=for-the-badge&logo=ko-fi&logoColor=white)](https://afdian.com/a/Beichen890)
 
-[![Star](https://img.shields.io/badge/⭐%20Star%20us%20on%20GitHub-181717?style=for-the-badge&logo=github&logoColor=white)](https://github.com/Beichen890/DracoDownloader)
+你的每一杯咖啡，都是让我多写一行代码的动力 ☕
 
 ---
 
