@@ -4,9 +4,13 @@
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![PyPI version](https://img.shields.io/pypi/v/draco-downloader)](https://pypi.org/project/draco-downloader/)
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
+[![GitHub Stars](https://img.shields.io/github/stars/Beichen890/DracoDownloader?style=social)](https://github.com/Beichen890/DracoDownloader)
 
 **纯自研 Python 多协议下载器** — 无 GPL 依赖，支持 HTTP/HTTPS、FTP/FTPS、M3U8/HLS、BitTorrent / 磁力链接。
 AI时代的自动档下载器！！！你还在为下载python而花费8美元吗？你还在为网络不通而烦恼吗？你还在为Openclaw不停重试而支付吗？
+
+> **对比传统方案**：wget/curl 单线程慢如蜗牛，aria2 配置繁琐不支持 BT 磁力，Openclaw 每次重试都在烧钱。
+> **DracoDownloader**：多协议一键下载 + 自动镜像加速 + 智能分片并发，Agent 调用的最佳选择，省时省钱省心！
 
 > v1.2.0 重磅更新：**自动最优镜像站选择** + **动态分片/线程数优化**，下载速度大幅提升！
 
@@ -300,6 +304,8 @@ v1.2.0 新增特性：
 
 > 如果 DracoDownloader 对你有帮助，欢迎请我喝杯咖啡 ☕
 > https://afdian.com/a/beichen890
+
+**如果觉得好用，给个 ⭐ Star 吧！你的支持是我更新的动力！** 🚀
 
 ---
 
