@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Downloads
+*.part
+*.progress
+.download_progress/
+*.tmp
+
+# Logs
+*.log
+
+# Environment
+venv/
+.env
+
+# Project
+.codewhale/

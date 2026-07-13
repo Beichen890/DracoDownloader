@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Optional, Dict, Any, Callable
 
 from .base import ProtocolDriver, DownloadHandle
-
+from ..optimizer import DownloadOptimizer, OptimalParams, NetworkProfile
 
 # === 常量定义 ===
 _DEFAULT_MAX_CONNECTIONS = 64
@@ -30,9 +30,15 @@ class HTTPDriver(ProtocolDriver):
     """HTTP/HTTPS 下载驱动 - 异步多分片"""
     
     def __init__(self, max_connections: int = _DEFAULT_MAX_CONNECTIONS,
-                 chunk_size: int = _DEFAULT_CHUNK_SIZE):
+                 chunk_size: int = _DEFAULT_CHUNK_SIZE,
+                 auto_optimize: bool = True,
+                 optimizer: Optional[DownloadOptimizer] = None):
         self.max_connections = max_connections
         self.chunk_size = chunk_size
+        self.auto_optimize = auto_optimize
+        self._optimizer = optimizer
+        self._optimal_params: Optional[OptimalParams] = None
+        self._network_profile: Optional[NetworkProfile] = None
         self.timeout = aiohttp.ClientTimeout(
             total=_HTTP_TIMEOUT_TOTAL,
             connect=_HTTP_TIMEOUT_CONNECT
@@ -61,6 +67,16 @@ class HTTPDriver(ProtocolDriver):
                     if resp.status == 206:
                         size = self._parse_content_range(resp.headers.get('content-range', ''))
                         accepts_ranges = True
+
+            # 自动优化：使用真实文件大小和网络条件计算最优参数
+            if self.auto_optimize and size > 0:
+                try:
+                    params, profile = await self._auto_optimize_params(url, size, accepts_ranges)
+                    self._optimal_params = params
+                    self._network_profile = profile
+                except Exception as e:
+                    # 优化失败不影响主流程
+                    pass
             
             return {
                 'size': size,
@@ -70,6 +86,21 @@ class HTTPDriver(ProtocolDriver):
                 'url': url
             }
     
+    async def _auto_optimize_params(self, url: str, size: int,
+                                     supports_range: bool) -> tuple:
+        """自动计算最优参数"""
+        if self._optimizer is None:
+            from ..optimizer import DownloadOptimizer
+            self._optimizer = DownloadOptimizer()
+
+        # 传入已知信息作为网络画像基础
+        profile = NetworkProfile(supports_range=supports_range)
+
+        # 执行完整优化（内部会进行带宽探测）
+        params = await self._optimizer.optimize_for_url(url, size, profile)
+
+        return params, self._optimizer.get_last_profile()
+
     async def download(self, handle: DownloadHandle,
                        callback: Optional[Callable[[int, int, int], None]] = None):
         """执行下载"""
@@ -84,6 +115,21 @@ class HTTPDriver(ProtocolDriver):
             if callback:
                 callback(total_size, total_size, 0)
             return
+
+        # === 使用动态优化参数 ===
+        use_optimized = False
+        opt_shards = None
+        opt_connections = None
+        opt_chunk_size = None
+
+        if self._optimal_params is not None and supports_range and total_size > 0:
+            opt_shards = self._optimal_params.shard_count
+            opt_connections = max(
+                self._optimal_params.max_connections,
+                self._optimal_params.thread_count
+            )
+            opt_chunk_size = self._optimal_params.chunk_size
+            use_optimized = True
         
         # 不支持 Range 或文件太小 → 单线程
         if total_size <= 0 or not supports_range or total_size < self.chunk_size * _SINGLE_FILE_THRESHOLD_FACTOR:
@@ -91,8 +137,14 @@ class HTTPDriver(ProtocolDriver):
             return
         
         # 多分片并发下载
-        chunk_count = self._calculate_chunks(total_size)
-        chunk_size = math.ceil(total_size / chunk_count)
+        if use_optimized:
+            chunk_count = opt_shards or self._calculate_chunks(total_size)
+            chunk_size = opt_chunk_size or math.ceil(total_size / chunk_count)
+            max_conn = opt_connections or self.max_connections
+        else:
+            chunk_count = self._calculate_chunks(total_size)
+            chunk_size = math.ceil(total_size / chunk_count)
+            max_conn = self.max_connections
         
         # 加载进度
         progress_file = Path(f"{output_path}.progress")
@@ -102,9 +154,9 @@ class HTTPDriver(ProtocolDriver):
         temp_dir = output_path.parent / f".{output_path.name}.parts"
         temp_dir.mkdir(exist_ok=True)
         
-        # 并发下载
+        # 并发下载（使用优化后的连接数）
         async with aiohttp.ClientSession(timeout=self.timeout) as session:
-            semaphore = asyncio.Semaphore(self.max_connections)
+            semaphore = asyncio.Semaphore(max_conn)
             tasks = []
             completed = sum(1 for d in chunks_done if d)
             
@@ -223,7 +275,7 @@ class HTTPDriver(ProtocolDriver):
                     chunk_file.unlink()
     
     def _calculate_chunks(self, total_size: int) -> int:
-        """动态计算分片数"""
+        """动态计算分片数（原始算法，自动优化时被覆盖）"""
         if total_size < 10 * 1024 * 1024:
             return 4
         if total_size < 100 * 1024 * 1024:
@@ -260,3 +312,16 @@ class HTTPDriver(ProtocolDriver):
         if '/' in cr:
             return int(cr.split('/')[-1])
         return 0
+
+    def get_optimization_info(self) -> Optional[Dict[str, Any]]:
+        """获取优化信息（用于展示）"""
+        if self._optimal_params is None:
+            return None
+        return {
+            'shard_count': self._optimal_params.shard_count,
+            'thread_count': self._optimal_params.thread_count,
+            'chunk_size': self._optimal_params.chunk_size,
+            'max_connections': self._optimal_params.max_connections,
+            'estimated_speed_mbps': self._optimal_params.estimated_speed_mbps,
+            'rationale': self._optimal_params.rationale,
+        }

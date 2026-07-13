@@ -5,15 +5,21 @@ DracoDownloader 核心入口
 import asyncio
 import time
 from pathlib import Path
-from typing import Optional, Dict, Any, Callable, AsyncIterator
+from typing import Optional, Dict, Any, Callable, AsyncIterator, List
 from dataclasses import dataclass, field
 
 from .logger import get_logger
 from .protocols import ProtocolRouter
 from .protocols.base import DownloadHandle
+from .protocols.http import HTTPDriver
 from .scheduler import Scheduler
 from .engine import DownloadEngine
 from .progress import ProgressManager
+from .mirror_selector import (
+    MirrorSelector, SmartMirrorDownloader,
+    MIRROR_CATEGORIES, MirrorProbeResult
+)
+from .optimizer import DownloadOptimizer, OptimalParams
 
 log = get_logger('core')
 
@@ -28,6 +34,8 @@ class DownloadResult:
     duration: float = 0.0
     protocol: str = "unknown"
     error: Optional[str] = None
+    mirror_used: Optional[str] = None   # 使用的镜像
+    optimization: Optional[Dict[str, Any]] = None  # 优化信息
 
 
 @dataclass
@@ -43,14 +51,90 @@ class ProgressEvent:
 class DracoDownloader:
     """DracoDownloader 主类"""
 
-    def __init__(self, max_concurrent: int = 5):
+    def __init__(self, max_concurrent: int = 5,
+                 auto_optimize: bool = True,
+                 auto_mirror: bool = False,
+                 mirror_region: str = "cn",
+                 optimizer: Optional[DownloadOptimizer] = None,
+                 mirror_selector: Optional[SmartMirrorDownloader] = None):
+        """
+        Args:
+            max_concurrent: 最大并发任务数
+            auto_optimize: 是否自动优化分片/线程参数
+            auto_mirror: 是否自动选择最优镜像站
+            mirror_region: 镜像区域 ("cn", "global", "auto")
+            optimizer: 自定义优化器
+            mirror_selector: 自定义镜像选择器
+        """
         self.scheduler = Scheduler(max_concurrent=max_concurrent)
         self.engine = DownloadEngine()
         self.progress = ProgressManager()
         self.router = ProtocolRouter()
+        self.auto_optimize = auto_optimize
+        self.auto_mirror = auto_mirror
+        self.mirror_region = mirror_region
+
+        # 镜像选择器
+        self._mirror_selector = mirror_selector
+        if self.auto_mirror and self._mirror_selector is None:
+            self._mirror_selector = SmartMirrorDownloader()
+
+        # 优化器
+        self._optimizer = optimizer
+        if self.auto_optimize and self._optimizer is None:
+            self._optimizer = DownloadOptimizer()
+
+        # 将优化器注入到 HTTP 驱动
+        self._inject_optimizer()
+
         # 注册调度器执行器
         self.scheduler.set_executor(self._execute_task)
-        log.info(f"DracoDownloader v{__import__('DracoDownloader', fromlist=['__version__']).__version__} initialized")
+
+        from DracoDownloader import __version__
+        log.info(f"DracoDownloader v{__version__} initialized "
+                 f"(optimize={auto_optimize}, mirror={auto_mirror})")
+
+    def _inject_optimizer(self):
+        """将优化器和镜像器注入到协议驱动中"""
+        for driver in self.router._drivers:
+            if isinstance(driver, HTTPDriver):
+                if self._optimizer and self.auto_optimize:
+                    driver._optimizer = self._optimizer
+                if self.auto_optimize:
+                    driver.auto_optimize = True
+
+    async def _resolve_mirror_url(self, url: str) -> tuple[str, Optional[str]]:
+        """
+        解析镜像URL
+
+        Returns:
+            (最终URL, 镜像名称)
+        """
+        if not self.auto_mirror or self._mirror_selector is None:
+            return url, None
+
+        # 选择镜像列表
+        if self.mirror_region == "auto":
+            mirrors = MIRROR_CATEGORIES.get("cn", []) + MIRROR_CATEGORIES.get("global", [])
+        else:
+            mirrors = MIRROR_CATEGORIES.get(self.mirror_region, [])
+
+        if not mirrors:
+            return url, None
+
+        try:
+            mirror_url = await self._mirror_selector.select_mirror(url, mirrors)
+            if mirror_url and mirror_url != url:
+                log.info(f"使用镜像: {mirror_url}")
+                # 从缓存获取镜像名称
+                cache_key = url.split("//")[1].split("/")[0] if "//" in url else url
+                cached = self._mirror_selector._cache.get(cache_key)
+                mirror_name = cached[0].name if cached and cached[0] else "mirror"
+                return mirror_url, mirror_name
+        except Exception as e:
+            log.warning(f"镜像选择失败，使用原始URL: {e}")
+
+        return url, None
 
     def download(self, url: str, output_path: str,
                  headers: Optional[Dict[str, str]] = None,
@@ -94,13 +178,17 @@ class DracoDownloader:
 
         # 启动下载任务（通过调度器管理）
         output_path = str(Path(output_path).resolve())
-        driver = self.router.route(url)
+
+        # 镜像解析
+        resolved_url, mirror_name = await self._resolve_mirror_url(url)
+
+        driver = self.router.route(resolved_url)
         if driver is None:
             yield ProgressEvent(progress=0, speed=0, downloaded=0, total=0, message="不支持的协议")
             return
 
         handle = DownloadHandle(
-            url=url,
+            url=resolved_url,
             output_path=output_path,
             headers=headers or {},
             proxy=proxy
@@ -108,7 +196,7 @@ class DracoDownloader:
 
         # 探测
         try:
-            metadata = await driver.probe(url)
+            metadata = await driver.probe(resolved_url)
             handle.total_size = metadata.get('size', 0)
             handle.metadata = metadata
         except (ValueError, OSError, ConnectionError) as e:
@@ -201,11 +289,20 @@ class DracoDownloader:
 
             log.info(f"Download complete: {output_path} ({handle.total_size} bytes, {speed_mb:.2f} MB/s)")
 
+            # 获取优化信息
+            opt_info = None
+            if hasattr(driver, 'get_optimization_info'):
+                try:
+                    opt_info = driver.get_optimization_info()
+                except Exception:
+                    pass
+
             return DownloadResult(
                 success=True, path=output_path,
                 size=handle.total_size,
                 speed=speed_mb, duration=duration,
-                protocol=driver.__class__.__name__
+                protocol=driver.__class__.__name__,
+                optimization=opt_info,
             )
 
         except (asyncio.CancelledError, Exception) as e:
@@ -224,16 +321,19 @@ class DracoDownloader:
         output_path = str(Path(output_path).resolve())
         log.info(f"Download: {url[:80]} -> {output_path}")
 
-        driver = self.router.route(url)
+        # 镜像解析
+        resolved_url, mirror_name = await self._resolve_mirror_url(url)
+
+        driver = self.router.route(resolved_url)
         if driver is None:
-            log.warning(f"Unsupported protocol: {url}")
+            log.warning(f"Unsupported protocol: {resolved_url}")
             return DownloadResult(
                 success=False, path=output_path,
                 error=f"不支持的协议: {url}"
             )
 
         handle = DownloadHandle(
-            url=url,
+            url=resolved_url,
             output_path=output_path,
             headers=headers or {},
             proxy=proxy
@@ -252,7 +352,7 @@ class DracoDownloader:
             handle.progress_callback = wrapped_cb
 
         try:
-            metadata = await driver.probe(url)
+            metadata = await driver.probe(resolved_url)
             handle.total_size = metadata.get('size', 0)
             handle.metadata = metadata
             log.debug(f"Probe: size={handle.total_size}, type={driver.__class__.__name__}")
@@ -267,6 +367,10 @@ class DracoDownloader:
 
         try:
             result = await self.scheduler.wait_for(task_id)
+
+            # 附加镜像信息
+            if mirror_name:
+                result.mirror_used = mirror_name
 
             return result
 
@@ -286,6 +390,32 @@ class DracoDownloader:
                 success=False, path=output_path, error=f"未知错误: {e}"
             )
 
+    async def optimize_url(self, url: str, file_size: int = 0) -> OptimalParams:
+        """
+        预优化指定URL
+
+        Args:
+            url: 目标URL
+            file_size: 文件大小（0=自动探测）
+
+        Returns:
+            最优参数
+        """
+        if self._optimizer is None:
+            self._optimizer = DownloadOptimizer()
+
+        if file_size == 0:
+            # 尝试探测文件大小
+            driver = self.router.route(url)
+            if driver:
+                try:
+                    metadata = await driver.probe(url)
+                    file_size = metadata.get('size', 0)
+                except Exception:
+                    pass
+
+        return await self._optimizer.optimize_for_url(url, file_size)
+
     def list_protocols(self) -> list[str]:
         return self.router.list_supported()
 
@@ -295,7 +425,9 @@ class DracoDownloader:
             'queued': self.scheduler.queued_count(),
             'completed': self.scheduler.completed_count(),
             'failed': self.scheduler.failed_count(),
-            'protocols': self.list_protocols()
+            'protocols': self.list_protocols(),
+            'auto_optimize': self.auto_optimize,
+            'auto_mirror': self.auto_mirror,
         }
 
     def cancel(self, task_id: str) -> bool:

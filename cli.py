@@ -4,10 +4,12 @@ DracoDownloader 命令行工具
 用法: python -m DracoDownloader <URL> -o <OUTPUT>
 
 支持:
-  - HTTP/HTTPS 多分片下载
+  - HTTP/HTTPS 多分片下载（含自动优化分片/线程）
   - FTP/FTPS 下载
   - M3U8/HLS 流下载（含 AES-128 加密）
   - BitTorrent / 磁力链接下载
+  - 自动最优镜像站选择 (--mirror)
+  - 动态最优分片/线程数计算 (--optimize)
   - 文件完整性校验 (--verify)
 """
 
@@ -51,7 +53,11 @@ def verify_file(path: str, algorithm: str = "sha256") -> str:
 
 
 async def main_async(args):
-    downloader = DracoDownloader()
+    downloader = DracoDownloader(
+        auto_optimize=args.optimize,
+        auto_mirror=args.mirror,
+        mirror_region=args.mirror_region,
+    )
 
     if args.list_protocols:
         print("支持的协议:")
@@ -59,8 +65,33 @@ async def main_async(args):
             print(f"  - {p}")
         return
 
+    # --dry-run 模式：只展示优化/镜像信息，不实际下载
+    if args.dry_run and args.url:
+        print(f"🔍 预分析: {args.url}")
+        print(f"📁 输出: {args.output}")
+        print(f"⚙️  自动优化: {'开启' if args.optimize else '关闭'}")
+        print(f"🪞 自动镜像: {'开启' if args.mirror else '关闭'} (区域: {args.mirror_region})")
+
+        if args.optimize:
+            print("\n📊 正在探测网络条件并计算最优参数...")
+            try:
+                params = await downloader.optimize_url(args.url)
+                print(f"  ✅ 最优分片数: {params.shard_count}")
+                print(f"  ✅ 最优线程数: {params.thread_count}")
+                print(f"  ✅ 分片大小: {params.chunk_size / 1024 / 1024:.1f} MB")
+                print(f"  ✅ 最大连接数: {params.max_connections}")
+                print(f"  ✅ 预估速度: {params.estimated_speed_mbps:.1f} Mbps")
+                print(f"  📋 说明: {params.rationale}")
+            except Exception as e:
+                print(f"  ⚠️ 优化失败: {e}")
+        return
+
     print(f"📥 下载: {args.url}")
     print(f"📁 输出: {args.output}")
+    if args.mirror:
+        print(f"🪞 自动镜像: 开启 (区域: {args.mirror_region})")
+    if args.optimize:
+        print(f"⚙️  自动优化: 开启")
 
     result = await downloader.download_async(
         url=args.url,
@@ -74,6 +105,19 @@ async def main_async(args):
         size_mb = result.size / 1024 / 1024
         print(f"✅ 完成! 大小: {size_mb:.2f} MB, "
               f"速度: {result.speed:.2f} MB/s, 耗时: {result.duration:.1f}s")
+
+        # 显示优化信息
+        if result.optimization:
+            opt = result.optimization
+            print(f"⚙️  优化信息:")
+            print(f"  - 分片数: {opt.get('shard_count', '?')}")
+            print(f"  - 线程数: {opt.get('thread_count', '?')}")
+            print(f"  - 连接数: {opt.get('max_connections', '?')}")
+            print(f"  - 预估速度: {opt.get('estimated_speed_mbps', 0):.1f} Mbps")
+
+        # 显示镜像信息
+        if result.mirror_used:
+            print(f"🪞 镜像站: {result.mirror_used}")
 
         # --verify 校验
         if args.verify:
@@ -96,12 +140,14 @@ async def main_async(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="DracoDownloader - 多协议下载工具",
+        description="DracoDownloader - 多协议下载工具（支持自动镜像和优化）",
         epilog="示例:\n"
                "  python -m DracoDownloader https://example.com/file.zip -o file.zip\n"
                "  python -m DracoDownloader https://example.com/stream.m3u8 -o video.mp4\n"
                "  python -m DracoDownloader magnet:?xt=urn:btih:... -o movie\n"
                "  python -m DracoDownloader https://... -o file --verify sha256\n"
+               "  python -m DracoDownloader https://... -o file --mirror --optimize\n"
+               "  python -m DracoDownloader https://... -o file --dry-run --optimize\n"
     )
 
     parser.add_argument("url", nargs="?", help="下载链接")
@@ -109,6 +155,23 @@ def main():
     parser.add_argument("-p", "--proxy", help="代理地址 (http://或socks5://)")
     parser.add_argument("-t", "--timeout", type=int, default=3600,
                         help="下载超时秒数 (默认: 3600)")
+
+    # 优化选项
+    opt_group = parser.add_argument_group("优化选项")
+    opt_group.add_argument("--optimize", action="store_true", default=True,
+                           help="启用自动最优分片/线程数计算 (默认: 开启)")
+    opt_group.add_argument("--no-optimize", action="store_false", dest="optimize",
+                           help="禁用自动优化")
+    opt_group.add_argument("--dry-run", action="store_true",
+                           help="只预分析并展示最优参数，不实际下载")
+
+    # 镜像选项
+    mirror_group = parser.add_argument_group("镜像选项")
+    mirror_group.add_argument("--mirror", action="store_true", default=False,
+                              help="启用自动最优镜像站选择")
+    mirror_group.add_argument("--mirror-region", default="cn",
+                              choices=["cn", "global", "auto"],
+                              help="镜像区域 (默认: cn，auto=自动选择最佳区域)")
 
     # 校验选项
     verify_group = parser.add_argument_group("校验选项")
@@ -121,7 +184,7 @@ def main():
     parser.add_argument("--list-protocols", action="store_true",
                         help="列出支持的协议")
     parser.add_argument("-v", "--version", action="version",
-                        version=f"DracoDownloader 1.0.0")
+                        version=f"DracoDownloader 1.2.0")
 
     args = parser.parse_args()
 
