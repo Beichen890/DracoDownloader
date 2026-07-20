@@ -134,11 +134,27 @@ class BTDownloader:
     MAX_CONNECTIONS = 20
 
     def __init__(self, source: str, output_path: str,
-                 progress_callback: Optional[Callable[[int, int, int], None]] = None):
+                 progress_callback: Optional[Callable[[int, int, int], None]] = None,
+                 sequential: bool = False,
+                 seeding_policy: Optional['SeedingPolicy'] = None,
+                 extra_trackers: Optional[List[str]] = None):
+        """初始化 BT 下载器
+
+        Args:
+            source: magnet 链接或 .torrent 文件路径
+            output_path: 输出路径
+            progress_callback: 进度回调 (downloaded, total, speed)
+            sequential: 是否顺序下载（边下边看场景，牺牲稀缺优先策略）
+            seeding_policy: 做种策略（None=不做种）
+            extra_trackers: 额外的 tracker 列表（如 Web Tracker 合并结果）
+        """
         self.source = source
         self.output_path = Path(output_path)
         self.progress_callback = progress_callback
         self.is_magnet = source.startswith('magnet:')
+        self.sequential = sequential
+        self.seeding_policy = seeding_policy
+        self.extra_trackers = extra_trackers or []
 
         self.meta: Optional[TorrentMeta] = None
 
@@ -289,9 +305,26 @@ class BTDownloader:
         if self._piece_count > 0:
             log.info(f"Download complete: {len(self._completed_pieces)}/{self._piece_count} pieces")
 
+        # 做种阶段（若启用）
+        if self.seeding_policy is not None and self.seeding_policy.enabled:
+            await self._seed_phase()
+
     async def _discover_peers(self) -> List[Peer]:
-        """发现 peers（DHT + HTTP tracker）"""
+        """发现 peers（DHT + HTTP tracker + 额外 tracker）"""
         found_set: Set[Tuple[str, int]] = set()
+
+        # 合并种子自带 tracker 和额外 tracker（如 Web Tracker）
+        all_trackers: List[str] = []
+        for t in self.meta.trackers:
+            if isinstance(t, bytes):
+                t = t.decode('utf-8', errors='replace')
+            if t:
+                all_trackers.append(t)
+        for t in self.extra_trackers:
+            if isinstance(t, bytes):
+                t = t.decode('utf-8', errors='replace')
+            if t and t not in all_trackers:
+                all_trackers.append(t)
 
         # DHT
         if self.dht:
@@ -306,8 +339,8 @@ class BTDownloader:
             except (asyncio.TimeoutError, Exception) as e:
                 log.debug(f"DHT peer discovery: {e}")
 
-        # HTTP trackers
-        for tracker_url in self.meta.trackers:
+        # HTTP trackers (包括自带的和额外的)
+        for tracker_url in all_trackers:
             if isinstance(tracker_url, bytes):
                 tracker_url = tracker_url.decode('utf-8', errors='replace')
             if tracker_url and tracker_url.startswith('http'):
@@ -319,7 +352,7 @@ class BTDownloader:
                     for p in peers:
                         found_set.add(p)
                 except (asyncio.TimeoutError, Exception) as e:
-                    log.debug(f"Tracker {tracker_url.split('/')[2]}: {e}")
+                    log.debug(f"Tracker {tracker_url.split('/')[2] if '://' in tracker_url else tracker_url}: {e}")
 
         # 去重、过滤无效 IP
         result = []
@@ -458,10 +491,24 @@ class BTDownloader:
         稀缺分片优先算法 - 选择 peer 拥有但下载最少的 piece
 
         策略优先级：
-        1. 优先选择该 peer 拥有且最稀缺的 piece
-        2. 若无稀缺数据，回退到顺序选择
-        3. 跳过已完成或 in-progress 的 piece
+        1. 顺序模式（self.sequential=True）→ 按索引顺序选第一个未完成 piece
+        2. 稀缺优先：选择 peer 拥有且最稀缺的 piece
+        3. 若无稀缺数据，回退到顺序选择
+        4. 跳过已完成或 in-progress 的 piece
         """
+        # 顺序模式：边下边看场景，按 piece 索引顺序下载
+        if self.sequential:
+            for idx in range(self._piece_count):
+                if idx in self._completed_pieces:
+                    continue
+                if idx in self._in_progress_pieces:
+                    continue
+                if idx not in self.pieces:
+                    continue
+                if peer.has_piece(idx):
+                    return idx
+            return None
+
         # 收集该 peer 可用的、未完成的 pieces
         candidates = []
         for idx in range(self._piece_count):
@@ -687,6 +734,28 @@ class BTDownloader:
         """停止下载"""
         self._running = False
         await self._cleanup()
+
+    async def _seed_phase(self):
+        """做种阶段 - 根据策略做种，完成后退出"""
+        from .seeding import SeedingController
+        controller = SeedingController(self.seeding_policy)
+        controller.start(downloaded=self._total_size)
+        log.info(
+            f"开始做种 (ratio_limit={self.seeding_policy.ratio_limit}, "
+            f"time_limit={self.seeding_policy.time_limit}s)"
+        )
+        # 做种期间不主动断开 peer 连接（实际 BT 做种需要实现上传协议，
+        # 当前自研栈以下载为主，这里实现时长/分享率门控逻辑）
+        try:
+            await controller.wait_until_stop(
+                poll_interval=5.0,
+                upload_reader=None,
+            )
+        except asyncio.CancelledError:
+            log.info("做种被取消")
+            raise
+        finally:
+            log.info("做种阶段结束")
 
     async def _cleanup(self):
         """清理资源"""
