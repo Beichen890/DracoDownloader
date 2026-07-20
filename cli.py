@@ -22,13 +22,29 @@ from pathlib import Path
 from DracoDownloader import DracoDownloader
 
 
+def _format_speed(speed_bps: int) -> str:
+    """将 bytes/s 格式化为人类可读字符串"""
+    if speed_bps >= 1024 * 1024 * 1024:
+        return f"{speed_bps / 1024 / 1024 / 1024:.2f} GB/s"
+    if speed_bps >= 1024 * 1024:
+        return f"{speed_bps / 1024 / 1024:.2f} MB/s"
+    if speed_bps >= 1024:
+        return f"{speed_bps / 1024:.1f} KB/s"
+    return f"{speed_bps} B/s"
+
+
 def progress_callback(event):
     """进度回调"""
     bar_length = 40
     filled = int(bar_length * event.progress / 100)
     bar = '█' * filled + '░' * (bar_length - filled)
-    speed_mb = event.speed / 1024 / 1024
-    print(f"\r[{bar}] {event.progress:.1f}% {speed_mb:.2f} MB/s", end='', flush=True)
+    speed_str = _format_speed(event.speed)
+    # 进度已到 100% 但速度仍大于 0，说明正在合并分片
+    if event.progress >= 100 and event.speed > 0:
+        status = f"合并中 {speed_str}"
+    else:
+        status = speed_str
+    print(f"\r[{bar}] {event.progress:.1f}% {status}", end='', flush=True)
 
 
 def verify_file(path: str, algorithm: str = "sha256") -> str:
@@ -70,7 +86,7 @@ async def main_async(args):
         print(f"🔍 预分析: {args.url}")
         print(f"📁 输出: {args.output}")
         print(f"⚙️  自动优化: {'开启' if args.optimize else '关闭'}")
-        print(f"🪞 自动镜像: {'开启' if args.mirror else '关闭'} (区域: {args.mirror_region})")
+        print(f"🦮 自动镜像: {'开启' if args.mirror else '关闭'} (区域: {args.mirror_region})")
 
         if args.optimize:
             print("\n📊 正在探测网络条件并计算最优参数...")
@@ -80,8 +96,8 @@ async def main_async(args):
                 print(f"  ✅ 最优线程数: {params.thread_count}")
                 print(f"  ✅ 分片大小: {params.chunk_size / 1024 / 1024:.1f} MB")
                 print(f"  ✅ 最大连接数: {params.max_connections}")
-                print(f"  ✅ 预估速度: {params.estimated_speed_mbps:.1f} Mbps")
-                print(f"  📋 说明: {params.rationale}")
+                print(f"  ✅ 估计速度: {params.estimated_speed_mbps:.1f} Mbps")
+                print(f"  🎯 说明: {params.rationale}")
             except Exception as e:
                 print(f"  ⚠️ 优化失败: {e}")
         return
@@ -89,7 +105,7 @@ async def main_async(args):
     print(f"📥 下载: {args.url}")
     print(f"📁 输出: {args.output}")
     if args.mirror:
-        print(f"🪞 自动镜像: 开启 (区域: {args.mirror_region})")
+        print(f"🦮 自动镜像: 开启 (区域: {args.mirror_region})")
     if args.optimize:
         print(f"⚙️  自动优化: 开启")
 
@@ -113,11 +129,11 @@ async def main_async(args):
             print(f"  - 分片数: {opt.get('shard_count', '?')}")
             print(f"  - 线程数: {opt.get('thread_count', '?')}")
             print(f"  - 连接数: {opt.get('max_connections', '?')}")
-            print(f"  - 预估速度: {opt.get('estimated_speed_mbps', 0):.1f} Mbps")
+            print(f"  - 估计速度: {opt.get('estimated_speed_mbps', 0):.1f} Mbps")
 
         # 显示镜像信息
         if result.mirror_used:
-            print(f"🪞 镜像站: {result.mirror_used}")
+            print(f"🦮 镜像站: {result.mirror_used}")
 
         # --verify 校验
         if args.verify:
@@ -184,7 +200,7 @@ def main():
     parser.add_argument("--list-protocols", action="store_true",
                         help="列出支持的协议")
     parser.add_argument("-v", "--version", action="version",
-                        version=f"DracoDownloader 1.2.0")
+                        version=f"DracoDownloader 1.3.0")
 
     args = parser.parse_args()
 
