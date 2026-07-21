@@ -56,22 +56,29 @@ class ProgressManager:
         file_path.unlink(missing_ok=True)
 
     def _save(self, task_id: str):
-        """保存到文件"""
+        """保存到文件（原子写入，防止文件损坏）"""
         data = self._cache.get(task_id)
         if data is None:
             return
 
         file_path = self.storage_dir / f"{task_id}.json"
-        with open(file_path, 'w') as f:
-            json.dump({
-                'task_id': data.task_id,
-                'downloaded': data.downloaded,
-                'total': data.total,
-                'speed': data.speed,
-                'progress': data.progress,
-                'updated_at': data.updated_at,
-                'chunks': data.chunks
-            }, f)
+        temp_path = self.storage_dir / f"{task_id}.tmp"
+
+        try:
+            with open(temp_path, 'w') as f:
+                json.dump({
+                    'task_id': data.task_id,
+                    'downloaded': data.downloaded,
+                    'total': data.total,
+                    'speed': data.speed,
+                    'progress': data.progress,
+                    'updated_at': data.updated_at,
+                    'chunks': data.chunks
+                }, f)
+
+            temp_path.replace(file_path)
+        except OSError:
+            temp_path.unlink(missing_ok=True)
 
     def _load(self, task_id: str) -> Optional[ProgressData]:
         """从文件加载"""
