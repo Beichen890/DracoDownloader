@@ -176,10 +176,8 @@ class DracoDownloader:
             except asyncio.QueueFull:
                 pass
 
-        # 启动下载任务（通过调度器管理）
         output_path = str(Path(output_path).resolve())
 
-        # 镜像解析
         resolved_url, mirror_name = await self._resolve_mirror_url(url)
 
         driver = self.router.route(resolved_url)
@@ -194,16 +192,14 @@ class DracoDownloader:
             proxy=proxy
         )
 
-        # 探测
         try:
             metadata = await driver.probe(resolved_url)
             handle.total_size = metadata.get('size', 0)
             handle.metadata = metadata
-        except (ValueError, OSError, ConnectionError) as e:
+        except (ValueError, OSError, ConnectionError, RuntimeError, TimeoutError) as e:
             yield ProgressEvent(progress=0, speed=0, downloaded=0, total=0, message=f"探测失败: {e}")
             return
 
-        # 通过调度器执行
         task_id = self.scheduler.add(handle, timeout=3600)
         download_task = asyncio.create_task(
             self._execute_download(driver, handle, task_id, on_progress)
@@ -215,6 +211,8 @@ class DracoDownloader:
                     event = await asyncio.wait_for(queue.get(), timeout=0.5)
                     yield event
                     if event.progress >= 100:
+                        if mirror_name:
+                            log.info(f"流式下载完成，使用镜像: {mirror_name}")
                         break
                 except asyncio.TimeoutError:
                     if download_task.done():

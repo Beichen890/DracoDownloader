@@ -117,13 +117,19 @@ class Scheduler:
                 task = await asyncio.wait_for(self._queue.get(), timeout=2)
             except asyncio.TimeoutError:
                 # 无待处理任务且无运行中任务 → 退出 worker
-                if not self._running:
+                # 需要检查是否还有 PAUSED 或 QUEUED 任务，避免丢失
+                has_pending = any(
+                    t.status in (TaskStatus.QUEUED, TaskStatus.PAUSED)
+                    for t in self._tasks.values()
+                )
+                if not self._running and not has_pending:
                     break
                 continue
 
             # 已取消的任务跳过
             if task.status == TaskStatus.CANCELLED:
                 self._resolve_future(task.id, None)
+                self._cleanup_task(task.id)
                 continue
 
             # 已暂停的任务重新入队
@@ -146,6 +152,13 @@ class Scheduler:
             )
             self._running[task.id] = run_task
             log.info(f"Task {task.id} started (running={len(self._running)}/{self.max_concurrent})")
+
+    def _cleanup_task(self, task_id: str):
+        """清理任务相关资源"""
+        self._cancel_events.pop(task_id, None)
+        future = self._futures.pop(task_id, None)
+        if future and not future.done():
+            future.cancel()
 
     async def _run_with_timeout(self, task: DownloadTask):
         """执行单个任务（支持超时和取消）"""
@@ -184,6 +197,7 @@ class Scheduler:
                 task.completed_at = time.time()
                 self._running.pop(task.id, None)
                 self._resolve_future(task.id, result)
+                self._cleanup_task(task.id)
                 log.info(f"Task {task.id} completed")
                 return
 
@@ -200,12 +214,14 @@ class Scheduler:
                 task.status = TaskStatus.FAILED
                 task.completed_at = time.time()
                 self._resolve_future_ex(task.id, TimeoutError(task.error))
+                self._cleanup_task(task.id)
 
         except asyncio.CancelledError:
             task.status = TaskStatus.CANCELLED
             task.completed_at = time.time()
             self._running.pop(task.id, None)
             self._resolve_future_ex(task.id, asyncio.CancelledError("Task cancelled"))
+            self._cleanup_task(task.id)
             log.info(f"Task {task.id} cancelled")
 
         except Exception as e:
@@ -221,6 +237,7 @@ class Scheduler:
                 task.status = TaskStatus.FAILED
                 task.completed_at = time.time()
                 self._resolve_future_ex(task.id, e)
+                self._cleanup_task(task.id)
                 log.warning(f"Task {task.id} failed after {task.retry_count} retries: {e}")
 
     def _resolve_future(self, task_id: str, result):

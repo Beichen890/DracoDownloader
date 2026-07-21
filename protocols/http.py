@@ -364,19 +364,28 @@ class HTTPDriver(ProtocolDriver):
             with open(output_path, 'wb') as out:
                 for i in range(count):
                     chunk_file = temp_dir / f"part_{i:08d}"
-                    if chunk_file.exists() and chunk_file.stat().st_size > 0:
-                        with open(chunk_file, 'rb') as f:
-                            while True:
-                                data = f.read(_MERGE_BUFFER_SIZE)
-                                if not data:
-                                    break
-                                out.write(data)
-                                merged += len(data)
-                                speed_tracker.add(merged)
-                                if thread_callback:
-                                    thread_callback(total_size, total_size,
-                                                    speed_tracker.get_speed())
-                        chunk_file.unlink()
+                    if not chunk_file.exists():
+                        raise RuntimeError(f"分片文件缺失: {chunk_file}")
+                    
+                    chunk_size = chunk_file.stat().st_size
+                    if chunk_size == 0:
+                        raise RuntimeError(f"分片文件为空: {chunk_file}")
+                    
+                    with open(chunk_file, 'rb') as f:
+                        while True:
+                            data = f.read(_MERGE_BUFFER_SIZE)
+                            if not data:
+                                break
+                            out.write(data)
+                            merged += len(data)
+                            speed_tracker.add(merged)
+                            if thread_callback:
+                                thread_callback(total_size, total_size,
+                                                speed_tracker.get_speed())
+                    chunk_file.unlink()
+            
+            if total_size > 0 and merged != total_size:
+                raise RuntimeError(f"合并后的文件大小不匹配: 期望 {total_size}, 实际 {merged}")
 
         await asyncio.to_thread(do_merge)
 

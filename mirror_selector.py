@@ -325,14 +325,24 @@ class SmartMirrorDownloader:
     @staticmethod
     def _build_mirror_url(mirror_base: str, original_url: str) -> str:
         """构建镜像URL"""
-        # 提取原始路径
-        if "://" in original_url:
-            path = "/" + "/".join(original_url.split("/")[3:])
-        else:
-            path = original_url
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(original_url)
+            path = parsed.path
+            if not path:
+                path = "/"
+            base = mirror_base.rstrip("/")
+            return f"{base}{path}"
+        except Exception:
+            if "://" in original_url:
+                path = "/" + "/".join(original_url.split("/")[3:])
+                if not path or path == "/":
+                    path = "/"
+            else:
+                path = original_url
 
-        base = mirror_base.rstrip("/")
-        return f"{base}{path}"
+            base = mirror_base.rstrip("/")
+            return f"{base}{path}"
 
     def clear_cache(self):
         """清除镜像缓存"""
