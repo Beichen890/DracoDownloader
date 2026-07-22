@@ -34,6 +34,8 @@ class Piece:
     failed_attempts: int = 0
 
     def add_block(self, offset: int, data: bytes):
+        if offset in self.blocks:
+            return
         self.blocks[offset] = data
         self.downloaded += len(data)
 
@@ -367,8 +369,8 @@ class BTDownloader:
 
     async def _tracker_announce(self, tracker_url: str) -> List[Tuple[str, int]]:
         """HTTP tracker announce"""
-        import urllib.request
         import urllib.parse
+        import aiohttp
         from .bencode import decode as bencode_decode
 
         params = {
@@ -382,7 +384,6 @@ class BTDownloader:
             'event': 'started',
         }
 
-        # 对 bytes 参数进行 URL 编码
         encoded_params = []
         for k, v in params.items():
             if isinstance(v, bytes):
@@ -392,21 +393,23 @@ class BTDownloader:
             encoded_params.append(f'{k}={encoded_v}')
 
         url = tracker_url + '?' + '&'.join(encoded_params)
-        req = urllib.request.Request(url, headers={'User-Agent': 'DracoDownloader/1.0'})
 
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            data = resp.read()
-            response = bencode_decode(data) if data else {}
-            if isinstance(response, dict):
-                peers_raw = response.get('peers', b'')
-                if isinstance(peers_raw, bytes):
-                    peers = []
-                    for i in range(0, len(peers_raw), 6):
-                        if i + 6 <= len(peers_raw):
-                            ip = '.'.join(str(b) for b in peers_raw[i:i+4])
-                            port = struct.unpack('!H', peers_raw[i+4:i+6])[0]
-                            peers.append((ip, port))
-                    return peers
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as session:
+            async with session.get(url, headers={'User-Agent': 'DracoDownloader/1.0'}) as resp:
+                if resp.status != 200:
+                    return []
+                data = await resp.read()
+                response = bencode_decode(data) if data else {}
+                if isinstance(response, dict):
+                    peers_raw = response.get('peers', b'')
+                    if isinstance(peers_raw, bytes):
+                        peers = []
+                        for i in range(0, len(peers_raw), 6):
+                            if i + 6 <= len(peers_raw):
+                                ip = '.'.join(str(b) for b in peers_raw[i:i+4])
+                                port = struct.unpack('!H', peers_raw[i+4:i+6])[0]
+                                peers.append((ip, port))
+                        return peers
         return []
 
     def _create_output_file(self):
@@ -614,7 +617,8 @@ class BTDownloader:
 
         while remaining > 0 and self._running and conn.is_connected:
             if conn.is_choking:
-                break
+                await asyncio.sleep(0.5)
+                continue
 
             size = min(block_size, remaining)
             key = (piece.index, offset)
@@ -637,12 +641,20 @@ class BTDownloader:
 
     def _on_piece_data(self, index: int, offset: int, data: bytes):
         """接收到 piece 数据回调"""
-        self._ensure_piece(index, len(data))
-
         if index not in self.pieces:
-            return
+            self._ensure_piece(index, len(data))
 
         piece = self.pieces[index]
+
+        expected_size = min(DEFAULT_BLOCK_SIZE, piece.length - offset)
+        if len(data) != expected_size:
+            log.warning(f"Piece {index} block size mismatch: expected {expected_size}, got {len(data)}")
+            return
+
+        if offset in piece.blocks:
+            log.debug(f"Piece {index} block at offset {offset} already exists")
+            return
+
         piece.add_block(offset, data)
         self._downloaded += len(data)
 
@@ -682,29 +694,40 @@ class BTDownloader:
 
     def _write_to_files(self, offset: int, data: bytes):
         """多文件写入"""
+        data_end = offset + len(data)
+
         for i, file_info in enumerate(self.meta.files):
             file_path = self.output_path.parent / file_info['path']
             f_start = sum(f['length'] for f in self.meta.files[:i])
             f_end = f_start + file_info['length']
 
+            if data_end <= f_start:
+                break
             if offset >= f_end:
                 continue
-            if offset + len(data) <= f_start:
-                break
 
-            write_start = max(0, offset - f_start)
-            write_end = min(file_info['length'], offset + len(data) - f_start)
-            if write_end > write_start:
-                file_path.parent.mkdir(parents=True, exist_ok=True)
-                try:
-                    with open(file_path, 'r+b') as f:
-                        f.seek(write_start)
-                        chunk_start = max(0, f_start - offset)
-                        chunk_end = min(len(data), f_end - offset)
-                        f.write(data[chunk_start:chunk_end])
-                except FileNotFoundError:
-                    with open(file_path, 'wb') as f:
-                        f.write(b'\x00' * file_info['length'])
+            overlap_start = max(offset, f_start)
+            overlap_end = min(data_end, f_end)
+
+            if overlap_end <= overlap_start:
+                continue
+
+            file_write_start = overlap_start - f_start
+            file_write_end = overlap_end - f_start
+            data_read_start = overlap_start - offset
+            data_read_end = overlap_end - offset
+
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+
+            try:
+                with open(file_path, 'r+b') as f:
+                    f.seek(file_write_start)
+                    f.write(data[data_read_start:data_read_end])
+            except FileNotFoundError:
+                with open(file_path, 'wb') as f:
+                    f.write(b'\x00' * file_info['length'])
+                    f.seek(file_write_start)
+                    f.write(data[data_read_start:data_read_end])
 
     def _report_progress(self):
         """报告进度"""
