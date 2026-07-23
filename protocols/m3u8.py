@@ -8,6 +8,7 @@ import aiohttp
 import re
 import shutil
 import os
+import threading
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 from typing import Optional, Dict, Any, Callable, List, Tuple
@@ -230,19 +231,16 @@ class M3U8Driver(ProtocolDriver):
                         async for chunk in resp.content.iter_chunked(1024 * 1024):
                             data.extend(chunk)
 
-                    # AES-128 解密
                     if aes_key is not None and iv is not None:
                         data = bytearray(self._decrypt_segment(bytes(data), aes_key, iv))
 
-                    # 写入文件
                     with open(output_file, 'wb') as f:
                         f.write(data)
 
                     if callback:
-                        total_downloaded = sum(
-                            f.stat().st_size for f in temp_dir.glob("segment_*")
-                        )
-                        callback(total_downloaded, 0, 0)
+                        segment_size = len(data)
+                        progress = int((current / total) * 100)
+                        callback(segment_size * current, segment_size * total, 0)
                     return
             except Exception:
                 if attempt == 2:

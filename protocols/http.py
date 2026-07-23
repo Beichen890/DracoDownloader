@@ -184,13 +184,11 @@ class HTTPDriver(ProtocolDriver):
         total_size = handle.total_size
         supports_range = handle.metadata.get('supports_range', False)
 
-        # 检查是否已完整下载
         if output_path.exists() and output_path.stat().st_size == total_size and total_size > 0:
             if callback:
                 callback(total_size, total_size, 0)
             return
 
-        # === 使用动态优化参数 ===
         use_optimized = False
         opt_shards = None
         opt_connections = None
@@ -205,12 +203,10 @@ class HTTPDriver(ProtocolDriver):
             opt_chunk_size = self._optimal_params.chunk_size
             use_optimized = True
 
-        # 不支持 Range 或文件太小 → 单线程
         if total_size <= 0 or not supports_range or total_size < self.chunk_size * _SINGLE_FILE_THRESHOLD_FACTOR:
             await self._download_single(handle, callback)
             return
 
-        # 多分片并发下载
         if use_optimized:
             chunk_count = opt_shards or self._calculate_chunks(total_size)
             chunk_size = opt_chunk_size or math.ceil(total_size / chunk_count)
@@ -220,63 +216,64 @@ class HTTPDriver(ProtocolDriver):
             chunk_size = math.ceil(total_size / chunk_count)
             max_conn = self.max_connections
 
-        # 加载进度
         progress_file = Path(f"{output_path}.progress")
         chunks_done = self._load_progress(progress_file, chunk_count)
 
-        # 创建临时目录
         temp_dir = output_path.parent / f".{output_path.name}.parts"
         temp_dir.mkdir(exist_ok=True)
 
-        # 进度与速度跟踪
         speed_tracker = _SpeedTracker()
         reporter = _ProgressReporter(total_size, callback, speed_tracker)
 
-        # 并发下载（使用优化后的连接数）
-        async with aiohttp.ClientSession(timeout=self.timeout) as session:
-            semaphore = asyncio.Semaphore(max_conn)
-            tasks = []
-            completed = sum(1 for d in chunks_done if d)
+        try:
+            async with aiohttp.ClientSession(timeout=self.timeout) as session:
+                semaphore = asyncio.Semaphore(max_conn)
+                tasks = []
+                completed = sum(1 for d in chunks_done if d)
 
+                for i in range(chunk_count):
+                    chunk_file = temp_dir / f"part_{i:08d}"
+                    if chunks_done[i]:
+                        if chunk_file.exists():
+                            reporter.update(i, chunk_file.stat().st_size)
+                        continue
+                    start = i * chunk_size
+                    end = min(start + chunk_size - 1, total_size - 1)
+                    tasks.append(self._download_chunk(
+                        handle.url, start, end, temp_dir, i,
+                        semaphore, session, reporter, total_size
+                    ))
+
+                if tasks:
+                    await asyncio.gather(*tasks)
+
+            completed = 0
             for i in range(chunk_count):
                 chunk_file = temp_dir / f"part_{i:08d}"
-                if chunks_done[i]:
-                    if chunk_file.exists():
-                        reporter.update(i, chunk_file.stat().st_size)
-                    continue
-                start = i * chunk_size
-                end = min(start + chunk_size - 1, total_size - 1)
-                tasks.append(self._download_chunk(
-                    handle.url, start, end, temp_dir, i,
-                    semaphore, session, reporter, total_size
-                ))
+                if chunk_file.exists() and chunk_file.stat().st_size > 0:
+                    completed += 1
 
-            if tasks:
-                await asyncio.gather(*tasks)
+            if completed == chunk_count:
+                await self._merge_chunks(temp_dir, output_path, chunk_count, callback, total_size)
+                progress_file.unlink(missing_ok=True)
+                self._cleanup_temp_dir(temp_dir)
+                if callback:
+                    callback(total_size, total_size, 0)
+            else:
+                self._save_progress(progress_file, [
+                    chunk_file.exists() for chunk_file in temp_dir.glob("part_*")
+                ])
+        except Exception:
+            self._cleanup_temp_dir(temp_dir)
+            raise
 
-        # 更新进度
-        completed = 0
-        for i in range(chunk_count):
-            chunk_file = temp_dir / f"part_{i:08d}"
-            if chunk_file.exists() and chunk_file.stat().st_size > 0:
-                completed += 1
-
-        # 合并分片
-        if completed == chunk_count:
-            await self._merge_chunks(temp_dir, output_path, chunk_count, callback, total_size)
-            progress_file.unlink(missing_ok=True)
-            # 清理临时目录
-            try:
-                temp_dir.rmdir()
-            except OSError:
-                pass
-            if callback:
-                callback(total_size, total_size, 0)
-        else:
-            # 保存进度
-            self._save_progress(progress_file, [
-                chunk_file.exists() for chunk_file in temp_dir.glob("part_*")
-            ])
+    def _cleanup_temp_dir(self, temp_dir: Path):
+        """清理临时目录"""
+        try:
+            import shutil
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        except Exception:
+            pass
 
     async def _download_chunk(self, url: str, start: int, end: int,
                               temp_dir: Path, idx: int,

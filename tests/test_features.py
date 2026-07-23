@@ -293,3 +293,91 @@ class TestSeeding:
         ctrl.start(downloaded=100)
         await ctrl.wait_until_stop(poll_interval=0.005)
         assert ctrl.should_stop() is True
+
+
+# ===== BT 下载器数据完整性 =====
+
+class TestBTDownloaderDataIntegrity:
+    def test_piece_block_size_validation(self):
+        from DracoDownloader.bittorrent.downloader import Piece
+
+        piece = Piece(index=0, length=32768, hash=None)
+
+        valid_block = b'\x00' * 16384
+        piece.add_block(0, valid_block)
+        assert piece.downloaded == 16384
+        assert 0 in piece.blocks
+
+    def test_piece_duplicate_block_prevention(self):
+        from DracoDownloader.bittorrent.downloader import Piece
+
+        piece = Piece(index=0, length=32768, hash=None)
+
+        block1 = b'\x01' * 16384
+        block2 = b'\x02' * 16384
+
+        piece.add_block(0, block1)
+        original_downloaded = piece.downloaded
+
+        piece.add_block(0, block2)
+
+        assert piece.downloaded == original_downloaded
+        assert piece.blocks[0] == block1
+
+    def test_multifile_write_boundaries(self):
+        import tempfile
+        import os
+        from DracoDownloader.bittorrent.downloader import TorrentMeta
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            meta = TorrentMeta(
+                info_hash=b'\x00' * 20,
+                info_hash_hex='00' * 20,
+                name='test',
+                piece_length=1024,
+                is_multi_file=True,
+                files=[
+                    {'path': 'file1.txt', 'length': 512},
+                    {'path': 'file2.txt', 'length': 512},
+                ]
+            )
+
+            for file_info in meta.files:
+                file_path = Path(tmpdir) / file_info['path']
+                file_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(file_path, 'wb') as f:
+                    f.write(b'\x00' * file_info['length'])
+
+            data = b'A' * 1024
+
+            offset = 0
+            data_end = offset + len(data)
+
+            for i, file_info in enumerate(meta.files):
+                file_path = Path(tmpdir) / file_info['path']
+                f_start = sum(f['length'] for f in meta.files[:i])
+                f_end = f_start + file_info['length']
+
+                if data_end <= f_start:
+                    break
+                if offset >= f_end:
+                    continue
+
+                overlap_start = max(offset, f_start)
+                overlap_end = min(data_end, f_end)
+
+                file_write_start = overlap_start - f_start
+                data_read_start = overlap_start - offset
+                data_read_end = overlap_end - offset
+
+                with open(file_path, 'r+b') as f:
+                    f.seek(file_write_start)
+                    f.write(data[data_read_start:data_read_end])
+
+            with open(Path(tmpdir) / 'file1.txt', 'rb') as f:
+                content1 = f.read()
+            with open(Path(tmpdir) / 'file2.txt', 'rb') as f:
+                content2 = f.read()
+
+            assert content1 == b'A' * 512
+            assert content2 == b'A' * 512
