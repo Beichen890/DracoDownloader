@@ -1,6 +1,6 @@
 # Changelog
 
-## [1.3.1] - 2026-07-23
+## [1.3.2] - 2026-07-23
 
 ### Fixed
 - **BitTorrent `_request_piece` 死循环**: peer 阻塞时改为等待后继续请求，避免下载卡住
@@ -9,9 +9,15 @@
 - **Tracker announce 阻塞事件循环**: 将 `urllib.request` 同步调用改为 `aiohttp` 异步调用
 - **HTTPDriver 临时目录泄漏**: 下载异常时清理 `.parts` 临时目录
 - **M3U8 进度回调并发安全**: 使用分片索引和大小直接计算进度，避免 glob 竞态
+- **PyPI 维护者信息**: 修正 `pyproject.toml` 作者为 `Beichen890 <15530226931@163.com>`
 
 ### Added
 - **数据完整性测试**: 新增 `TestBTDownloaderDataIntegrity` 测试类
+
+## [1.3.1] - 2026-07-23
+
+### Fixed
+- 同 v1.3.2（元数据维护者信息未修正）
 
 ## [1.3.0] - 2026-07-22
 
