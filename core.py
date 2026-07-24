@@ -303,8 +303,10 @@ class DracoDownloader:
                 optimization=opt_info,
             )
 
-        except (asyncio.CancelledError, Exception) as e:
-            error_msg = str(e) if not isinstance(e, asyncio.CancelledError) else "下载已取消"
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            error_msg = str(e)
             log.error(f"Download failed: {error_msg}")
             return DownloadResult(
                 success=False, path=output_path, error=error_msg

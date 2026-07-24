@@ -230,10 +230,22 @@ class BTDownloader:
             is_multi = True
             for f_info in info['files']:
                 path_parts = f_info.get('path', [])
-                f_path = '/'.join(
-                    p.decode() if isinstance(p, bytes) else p
-                    for p in path_parts
-                ) if isinstance(path_parts, list) else str(path_parts)
+                if isinstance(path_parts, list):
+                    # 安防：过滤 ".."、空段、绝对路径与 Windows 盘符段，防止
+                    # 恶意 .torrent 通过路径穿越写入下载目录之外（zip-slip）。
+                    safe_parts = []
+                    for p in path_parts:
+                        part = p.decode() if isinstance(p, bytes) else str(p)
+                        if part in ('', '.', '..'):
+                            continue
+                        if part.startswith('/') or part.startswith('\\'):
+                            continue
+                        if len(part) >= 2 and part[1] == ':':  # 如 C: ...
+                            continue
+                        safe_parts.append(part)
+                    f_path = '/'.join(safe_parts) or 'unnamed'
+                else:
+                    f_path = str(path_parts)
                 f_len = f_info.get('length', 0)
                 files.append({'path': f_path, 'length': f_len})
                 total_size += f_len
