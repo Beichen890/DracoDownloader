@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "draco-downloader"
-version = "1.3.0"
+version = "1.3.2"
 description = "Pure Python multi-protocol download engine for AI Agents — zero GPL dependencies"
 readme = "README.md"
 authors = [
-    {name = "DracoHub Team", email = "draco@dracohub.com"}
+    {name = "Beichen890", email = "15530226931@163.com"}
 ]
 license = {text = "MIT"}
 requires-python = ">=3.9"

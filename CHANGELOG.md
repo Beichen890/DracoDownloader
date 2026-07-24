@@ -1,5 +1,35 @@
 # Changelog
 
+## [1.3.2] - 2026-07-23
+
+### Fixed
+- **BitTorrent `_request_piece` 死循环**: peer 阻塞时改为等待后继续请求，避免下载卡住
+- **BitTorrent 重复 piece 块导致数据损坏**: `Piece.add_block()` 增加重复检测，`_on_piece_data()` 增加块大小验证
+- **BitTorrent 多文件写入边界错误**: 修复跨越文件边界的 piece 写入位置计算，防止数据丢失
+- **Tracker announce 阻塞事件循环**: 将 `urllib.request` 同步调用改为 `aiohttp` 异步调用
+- **HTTPDriver 临时目录泄漏**: 下载异常时清理 `.parts` 临时目录
+- **M3U8 进度回调并发安全**: 使用分片索引和大小直接计算进度，避免 glob 竞态
+- **PyPI 维护者信息**: 修正 `pyproject.toml` 作者为 `Beichen890 <15530226931@163.com>`
+
+### Added
+- **数据完整性测试**: 新增 `TestBTDownloaderDataIntegrity` 测试类
+
+## [1.3.1] - 2026-07-23
+
+### Fixed
+- 同 v1.3.2（元数据维护者信息未修正）
+
+## [1.3.0] - 2026-07-22
+
+### Added
+- **TaskStep 步骤化管线**: 将下载流程分解为 probe→download→merge→verify→seed，Agent 可观测
+- **集中化错误目录**: 稳定错误码 + 可重试标记，供 Agent 程序化处理
+- **BT 多源加载器**: magnet / URL / 本地文件统一入口
+- **Web Tracker 自动合并**: 拉取公开 tracker 列表与种子自带合并去重
+- **BT 做种策略**: 分享率/时长双限速
+- **配置系统**: ConfigItem + 校验器，支持环境变量 `DRACO_*` 覆盖
+- **顺序下载模式**: 支持边下边看场景
+
 ## [1.1.0] - 2025-07-12
 
 ### Added
