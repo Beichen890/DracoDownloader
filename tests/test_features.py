@@ -381,3 +381,293 @@ class TestBTDownloaderDataIntegrity:
 
             assert content1 == b'A' * 512
             assert content2 == b'A' * 512
+
+
+# ===== Zip-slip 路径安全过滤（关键缺陷回归测试） =====
+
+class TestZipSlipSanitization:
+    """
+    针对 BitTorrent 多文件模式 path 字段的 Zip-slip/路径穿越防护测试。
+
+    触发场景：攻击者构造恶意 .torrent，在 info.files[].path 中放入
+    `..`、绝对路径、Windows 盘符、或在单个段内嵌入分隔符，
+    企图让 Path(download_dir) / malicious_path 解析到下载目录之外。
+    """
+
+    def test_sanitize_normal_path(self):
+        from DracoDownloader.bittorrent.utils import sanitize_torrent_path_parts
+        result = sanitize_torrent_path_parts([b'dir', b'subdir', 'file.txt'])
+        assert result == 'dir/subdir/file.txt'
+
+    def test_sanitize_strips_dotdot_and_empty(self):
+        from DracoDownloader.bittorrent.utils import sanitize_torrent_path_parts
+        # 单独的 '..'、'.'、'' 段必须被过滤
+        result = sanitize_torrent_path_parts(
+            ['', '.', '..', 'safe_dir', '..', '.', '', 'safe_file.txt']
+        )
+        # 不能以 '..' 开头，也不能包含父目录逃逸
+        from pathlib import PurePosixPath
+        normalized = PurePosixPath(result)
+        assert not normalized.is_absolute()
+        assert '..' not in normalized.parts
+        assert result == 'safe_dir/safe_file.txt'
+
+    def test_sanitize_rejects_absolute_path_segment(self):
+        from DracoDownloader.bittorrent.utils import sanitize_torrent_path_parts
+        # 以 / 或 \ 开头的段必须被丢弃
+        result = sanitize_torrent_path_parts(['/etc', b'passwd'])
+        # '/etc' 被丢弃，仅保留 'passwd'
+        assert result == 'passwd'
+        # 整体结果不能是绝对路径
+        from pathlib import PurePosixPath
+        assert not PurePosixPath(result).is_absolute()
+
+    def test_sanitize_rejects_windows_drive_letter(self):
+        from DracoDownloader.bittorrent.utils import sanitize_torrent_path_parts
+        result = sanitize_torrent_path_parts(['C:', 'Windows', 'System32'])
+        # 'C:' 段必须被丢弃
+        assert 'C:' not in result
+        assert result == 'Windows/System32' or result == 'Windows/System32'
+
+    def test_sanitize_bypass_with_separator_in_segment(self):
+        """
+        关键绕过用例：单个段内含分隔符 + .. 组合。
+
+        旧实现仅逐段比对是否等于 '..'，未检查段内是否存在 '/' 或 '\\'。
+        恶意构造 path = ['subdir/../../../etc/passwd'] 会绕过检查，
+        但 Path(download_dir) / 'subdir/../../../etc/passwd' 实际会
+        解析到 download_dir 的 3 级父目录下的 etc/passwd，
+        造成任意文件覆盖（zip-slip 经典变种）。
+        """
+        from DracoDownloader.bittorrent.utils import sanitize_torrent_path_parts
+
+        # 正向斜线嵌入
+        malicious = ['subdir/../../../etc/passwd']
+        result = sanitize_torrent_path_parts(malicious)
+        # 含 '/' 的段必须整个被丢弃；剩余段为空 → 返回 'unnamed'
+        assert result == 'unnamed', (
+            f"段内分隔符未被拦截：{result!r}，存在 zip-slip 风险"
+        )
+
+        # 反斜线嵌入（Windows/UNC 变种）
+        malicious_backslash = ['subdir\\..\\..\\..\\etc\\passwd']
+        result_bs = sanitize_torrent_path_parts(malicious_backslash)
+        assert result_bs == 'unnamed', (
+            f"段内反斜线未被拦截：{result_bs!r}，存在 zip-slip 风险"
+        )
+
+    def test_sanitize_all_malicious_returns_unnamed(self):
+        from DracoDownloader.bittorrent.utils import sanitize_torrent_path_parts
+        # 全部是恶意段时，返回占位 'unnamed'，不能是空串或 '..'
+        assert sanitize_torrent_path_parts(['..', '..']) == 'unnamed'
+        assert sanitize_torrent_path_parts(['/etc']) == 'unnamed'
+        assert sanitize_torrent_path_parts(['D:']) == 'unnamed'
+        assert sanitize_torrent_path_parts([]) == 'unnamed'
+
+    def test_sanitized_path_never_escapes_output_dir(self):
+        """
+        端到端校验：对净化后的结果，
+        `Path(output_dir) / sanitized_path` 仍必须位于 output_dir 之下。
+        """
+        from pathlib import Path
+        from DracoDownloader.bittorrent.utils import sanitize_torrent_path_parts
+
+        output_dir = Path('/tmp/draco_test_downloads').resolve()
+
+        malicious_cases = [
+            ['..', '..', 'etc', 'passwd'],
+            ['/etc', 'passwd'],
+            ['nested/../../evil.sh'],
+            ['dir', '..\\..\\evil.dat'],
+        ]
+
+        for case in malicious_cases:
+            safe = sanitize_torrent_path_parts(case)
+            target = (output_dir / safe).resolve()
+            # 关键断言：最终解析路径必须在输出目录内
+            assert str(target).startswith(str(output_dir) + '/') or target == output_dir, (
+                f"净化失败：case={case!r} → safe={safe!r} → target={target}，"
+                f"逃出了输出目录 {output_dir}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_loader_parse_bytes_zip_slip(self, tmp_path):
+        """
+        BT 多源加载器 `_parse_torrent_bytes` 必须净化恶意 path 段。
+        （原代码完全无过滤 → 任意路径写入）
+        """
+        from DracoDownloader.bittorrent.bencode import encode
+        from DracoDownloader.bittorrent.loaders import _parse_torrent_bytes
+
+        info = {
+            b'name': b'malicious',
+            b'piece length': 16384,
+            b'pieces': b'x' * 20,
+            b'files': [
+                # Case A: 多段式 '..' 穿越
+                {b'path': [b'..', b'..', b'etc', b'passwd.sh'], b'length': 100},
+                # Case B: 段内分隔符绕过（单段含多个 '/' + '..'）
+                {b'path': [b'subdir/../../run/evil.pwn'], b'length': 200},
+                # Case C: 安全对照组
+                {b'path': [b'data', b'good.txt'], b'length': 50},
+            ],
+        }
+        torrent = {b'announce': b'http://tracker.example', b'info': info}
+        data = encode(torrent)
+
+        resolved = _parse_torrent_bytes(data, source='test', source_type='file')
+        assert len(resolved.files) == 3
+
+        # Case A: '..' 段被剔除 → 只剩 etc/passwd.sh（安全子路径）
+        f0 = resolved.files[0]['path']
+        assert '..' not in f0.split('/')
+        # Case B: 段内分隔符 → 整段丢弃 → 'unnamed'
+        assert resolved.files[1]['path'] == 'unnamed'
+        # Case C: 正常路径不变
+        assert resolved.files[2]['path'] == 'data/good.txt'
+
+        # 二次校验：所有结果在拼接后都不能逃出下载目录
+        out = (tmp_path / 'download_dir').resolve()
+        for finfo in resolved.files:
+            target = (out / finfo['path']).resolve()
+            assert str(target).startswith(str(out) + '/') or target == out
+
+    @pytest.mark.asyncio
+    async def test_downloader_parse_torrent_segment_separator_bypass(self, tmp_path):
+        """
+        BTDownloader._parse_torrent_file 对段内分隔符的绕过必须被拦截。
+        （原实现仅检查段是否 == '..'，未检查段内含 '/' → zip-slip 绕过）
+        """
+        from DracoDownloader.bittorrent.bencode import encode
+
+        info = {
+            b'name': b'bypass_test',
+            b'piece length': 16384,
+            b'pieces': b'x' * 20,
+            b'files': [
+                # 单段恶意：a/b/../../../x  + 段内分隔符
+                {b'path': [b'a/b/../../../overwrite_me'], b'length': 10},
+            ],
+        }
+        torrent = {b'announce': b'http://t', b'info': info}
+        torrent_path = tmp_path / "m.torrent"
+        torrent_path.write_bytes(encode(torrent))
+
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+
+        # 直接实例化 BTDownloader 并解析（构造 source 为本地 torrent）
+        from DracoDownloader.bittorrent.downloader import BTDownloader
+        dl = BTDownloader.__new__(BTDownloader)
+        dl.output_path = out_dir / "target"
+        dl._parse_torrent_file(str(torrent_path))
+
+        assert dl.meta is not None
+        assert len(dl.meta.files) == 1
+        sanitized = dl.meta.files[0]['path']
+        # 恶意段内分隔符必须被拦截，占位 unnamed
+        assert sanitized == 'unnamed', (
+            f"段内分隔符绕过未拦截，得到 path={sanitized!r}"
+        )
+        # 最终写入路径不能跳出 out_dir
+        target = (out_dir / sanitized).resolve()
+        assert str(target).startswith(str(out_dir.resolve()) + '/') or target == out_dir.resolve()
+
+
+# ===== 调度器 CancelledError 传播 + Pending Task 清理 =====
+
+class TestSchedulerCancellation:
+    """
+    验证调度器取消/超时后，pending 的 asyncio.Task 被正确 cancel + await，
+    确保其 finally 清理块能执行（原实现只 cancel 不 await → 资源泄漏）。
+    """
+
+    @pytest.mark.asyncio
+    async def test_cancelled_task_cleanup_runs(self):
+        from DracoDownloader.scheduler import Scheduler, TaskStatus
+
+        cleanup_flag = {"ran": False}
+        task_started = asyncio.Event()
+
+        async def slow_executor(handle, task_id):
+            try:
+                task_started.set()
+                await asyncio.sleep(10.0)
+                return "should-not-reach"
+            finally:
+                # 这是底层驱动释放连接、关闭句柄的关键路径；
+                # 如果 pending task 只被 cancel() 而不 await，
+                # 该块可能直到 GC 才运行或报 "Task destroyed but pending"。
+                cleanup_flag["ran"] = True
+
+        s = Scheduler(max_concurrent=1)
+        s.set_executor(slow_executor)
+        task_id = s.add("handle", timeout=3600)
+
+        # 等 executor 进入 sleep（确认 task 实际启动了）
+        await asyncio.wait_for(task_started.wait(), timeout=2.0)
+
+        # 触发取消（走 scheduler.cancel → cancel_event → wait_cancel → CancelledError）
+        assert s.cancel(task_id) is True
+
+        # 等待关联的 Future 完成（这意味着 _run_with_timeout 的异常
+        # 处理/清理流程已经全部结束，pending tasks 的 await 也已执行）
+        fut = s._futures.get(task_id)
+        if fut is not None:
+            done, _ = await asyncio.wait(
+                [asyncio.shield(fut)], timeout=5.0
+            )
+            # 即使 fut 被 set_exception(CancelledError) 也会进入 done 集合
+
+        # 为保险起见，再轮询一小段时间让 finally 有机会跑
+        deadline = asyncio.get_running_loop().time() + 3.0
+        while (not cleanup_flag["ran"]
+               and asyncio.get_running_loop().time() < deadline):
+            await asyncio.sleep(0.05)
+
+        # 关键断言：finally 块必须已执行
+        assert cleanup_flag["ran"] is True, (
+            "被取消的 task 未被 await，finally 清理块未执行 → 资源泄漏"
+        )
+
+    @pytest.mark.asyncio
+    async def test_timeout_branch_pending_tasks_awaited(self):
+        """
+        超时分支中，pending tasks 也必须被 await（触发 finally）。
+        """
+        from DracoDownloader.scheduler import Scheduler, TaskStatus
+
+        cleanup_flag = {"ran": False}
+        task_started = asyncio.Event()
+
+        async def slow_executor(handle, task_id):
+            try:
+                task_started.set()
+                await asyncio.sleep(30.0)
+                return "nope"
+            finally:
+                cleanup_flag["ran"] = True
+
+        s = Scheduler(max_concurrent=1)
+        s.set_executor(slow_executor)
+        # 极短超时：让 wait(..., timeout=0.05) 先完成，进入 timeout 分支
+        task_id = s.add("handle", timeout=0.05)
+
+        await asyncio.wait_for(task_started.wait(), timeout=2.0)
+
+        # 等待任务 future 进入终态（set_result / set_exception 被调用过）
+        fut = s._futures.get(task_id)
+        if fut is not None:
+            await asyncio.wait([asyncio.shield(fut)], timeout=8.0)
+
+        # 再轮询 finally 是否有机会执行
+        deadline = asyncio.get_running_loop().time() + 5.0
+        terminal = {TaskStatus.FAILED.value, TaskStatus.CANCELLED.value,
+                    TaskStatus.COMPLETED.value}
+        while (not cleanup_flag["ran"]
+               and asyncio.get_running_loop().time() < deadline):
+            await asyncio.sleep(0.05)
+
+        assert cleanup_flag["ran"] is True, (
+            "超时分支中 pending task 未被 await，finally 未执行 → 资源泄漏"
+        )

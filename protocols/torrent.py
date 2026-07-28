@@ -14,6 +14,7 @@ from ..bittorrent.magnet import MagnetParser
 from ..bittorrent.loaders import resolve as resolve_source, ResolvedTorrent
 from ..bittorrent.trackers import enrich_trackers
 from ..bittorrent.seeding import SeedingPolicy
+from ..bittorrent.utils import sanitize_torrent_path_parts
 from ..config import get_global_config
 from ..logger import get_logger
 
@@ -99,9 +100,10 @@ class TorrentDriver(ProtocolDriver):
                 for f_info in files:
                     path_parts = f_info.get('path', [])
                     if isinstance(path_parts, list):
-                        f_path = '/'.join(p.decode() if isinstance(p, bytes) else p for p in path_parts)
+                        # Zip-slip 防护：过滤路径穿越、段内分隔符、盘符等
+                        f_path = sanitize_torrent_path_parts(path_parts)
                     else:
-                        f_path = str(path_parts)
+                        f_path = sanitize_torrent_path_parts([path_parts])
                     file_list.append({
                         'path': f_path,
                         'length': f_info.get('length', 0),

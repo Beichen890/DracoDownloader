@@ -185,6 +185,14 @@ class Scheduler:
             # 取消其他 pending 任务
             for p in pending:
                 p.cancel()
+            # 关键：await 已取消的 pending 任务，确保它们的 finally/清理块
+            # 有机会执行；否则会出现资源泄漏、Task was destroyed but pending 警告，
+            # 以及 CancelledError 无法正确传递到底层驱动的问题。
+            if pending:
+                results = await asyncio.gather(*pending, return_exceptions=True)
+                for r in results:
+                    if isinstance(r, Exception) and not isinstance(r, asyncio.CancelledError):
+                        log.debug(f"Pending task unexpected exception: {r}")
 
             # 检查结果
             for d in done:

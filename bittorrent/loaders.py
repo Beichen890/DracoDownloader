@@ -20,6 +20,7 @@ from ..logger import get_logger
 from ..errors import DracoError, bt_invalid_torrent, make_error, ERR_BT_METADATA
 from .magnet import MagnetParser, MagnetLink
 from .bencode import decode_torrent, info_hash as calc_info_hash
+from .utils import sanitize_torrent_path_parts
 
 log = get_logger('bittorrent.loaders')
 
@@ -111,10 +112,11 @@ def _parse_torrent_bytes(data: bytes, source: str, source_type: str) -> Resolved
         is_multi = True
         for f_info in info['files']:
             path_parts = f_info.get('path', [])
-            f_path = '/'.join(
-                p.decode() if isinstance(p, bytes) else p
-                for p in path_parts
-            ) if isinstance(path_parts, list) else str(path_parts)
+            if isinstance(path_parts, list):
+                # Zip-slip 防护：逐段过滤并归一化，禁止路径穿越
+                f_path = sanitize_torrent_path_parts(path_parts)
+            else:
+                f_path = sanitize_torrent_path_parts([path_parts])
             f_len = f_info.get('length', 0)
             files.append({'path': f_path, 'length': f_len})
             total_size += f_len
