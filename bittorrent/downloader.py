@@ -694,14 +694,17 @@ class BTDownloader:
             offset = index * self._piece_length
             self._write_to_files(offset, data)
         else:
+            seek_pos = index * self._piece_length
             try:
                 with open(self.output_path, 'r+b') as f:
-                    seek_pos = index * self._piece_length
                     f.seek(seek_pos)
                     f.write(data)
-            except (FileNotFoundError, OSError):
+            except FileNotFoundError:
+                # 文件尚未创建（不应发生，因为 _create_output_file 已创建），
+                # 安全回退：先创建完整大小的文件再写入，避免截断
                 with open(self.output_path, 'wb') as f:
-                    f.seek(index * self._piece_length)
+                    f.truncate(self._total_size)
+                    f.seek(seek_pos)
                     f.write(data)
 
     def _write_to_files(self, offset: int, data: bytes):

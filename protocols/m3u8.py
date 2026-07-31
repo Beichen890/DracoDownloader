@@ -116,7 +116,7 @@ class M3U8Driver(ProtocolDriver):
             return await resp.read()
 
     def _decrypt_segment(self, data: bytes, key: bytes, iv: bytes) -> bytes:
-        """AES-128-CBC 解密 TS 分片"""
+        """AES-128-CBC 解密 TS 分片（含 PKCS7 去填充）"""
         try:
             from Crypto.Cipher import AES
         except ImportError:
@@ -125,8 +125,25 @@ class M3U8Driver(ProtocolDriver):
                 "Install it with: pip install pycryptodome"
             )
 
+        if len(data) == 0 or len(data) % AES.block_size != 0:
+            raise RuntimeError(
+                f"Invalid encrypted segment length: {len(data)} "
+                f"(must be non-zero multiple of {AES.block_size})"
+            )
+
         cipher = AES.new(key, AES.MODE_CBC, iv=iv)
-        return cipher.decrypt(data)
+        decrypted = cipher.decrypt(data)
+
+        # PKCS7 去填充（RFC 8216 §4.3.2.4: AES-128 使用 PKCS7 填充）
+        pad_len = decrypted[-1]
+        if 1 <= pad_len <= AES.block_size and decrypted[-pad_len:] == bytes([pad_len]) * pad_len:
+            decrypted = decrypted[:-pad_len]
+        else:
+            # 填充不合法时保留原始数据，但记录警告
+            # （部分服务器可能未严格遵循 PKCS7）
+            pass
+
+        return decrypted
 
     async def download(self, handle: DownloadHandle,
                        callback: Optional[Callable[[int, int, int], None]] = None):

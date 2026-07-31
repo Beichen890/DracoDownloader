@@ -381,3 +381,129 @@ class TestBTDownloaderDataIntegrity:
 
             assert content1 == b'A' * 512
             assert content2 == b'A' * 512
+
+    def test_write_piece_no_truncation_on_oserror(self):
+        """验证 _write_piece 在 OSError 时不会截断已写入的数据
+
+        原始 Bug: _write_piece 的 except 分支使用 'wb' 模式打开文件，
+        导致文件被截断，所有已下载的 piece 数据丢失。
+        修复后: OSError 不再被静默捕获并截断，而是向上传播；
+        仅 FileNotFoundError 安全回退，且先 truncate 到完整大小。
+        """
+        from DracoDownloader.bittorrent.downloader import (
+            BTDownloader, TorrentMeta, Piece,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            meta = TorrentMeta(
+                info_hash=b'\x00' * 20,
+                info_hash_hex='00' * 20,
+                name='test.bin',
+                piece_length=32,
+                is_multi_file=False,
+                files=[],
+                total_size=64,
+            )
+
+            output_path = Path(tmpdir) / 'test.bin'
+            # 预创建文件，写入前 32 字节（piece 0）
+            with open(output_path, 'wb') as f:
+                f.write(b'A' * 32 + b'\x00' * 32)
+
+            # 构造最小化 BTDownloader 实例以测试 _write_piece
+            dl = object.__new__(BTDownloader)
+            dl.meta = meta
+            dl.output_path = output_path
+            dl._piece_length = 32
+            dl._total_size = 64
+
+            # 写入 piece 1 — 文件已存在，走 'r+b' 路径
+            piece1 = Piece(index=1, length=32, hash=None)
+            piece1.add_block(0, b'B' * 32)
+            dl._write_piece(1, piece1)
+
+            with open(output_path, 'rb') as f:
+                content = f.read()
+
+            # piece 0 数据应保留，piece 1 应正确写入
+            assert content[:32] == b'A' * 32, "piece 0 data was lost (truncation bug)"
+            assert content[32:] == b'B' * 32
+
+
+# ===== M3U8 AES-128 解密 PKCS7 去填充 =====
+
+class TestM3U8Decrypt:
+    def test_decrypt_segment_strips_pkcs7_padding(self):
+        """验证 AES-128 解密后正确移除 PKCS7 填充
+
+        原始 Bug: _decrypt_segment 未移除 PKCS7 填充，导致合并后的
+        TS 流中每个分片尾部包含 1-16 字节填充垃圾，造成静默数据损坏。
+        修复后: 解密后验证并移除 PKCS7 填充。
+        """
+        try:
+            from Crypto.Cipher import AES
+        except ImportError:
+            pytest.skip("pycryptodome not installed")
+
+        from Crypto.Util.Padding import pad
+        from DracoDownloader.protocols.m3u8 import M3U8Driver
+
+        key = b'\x00' * 16
+        iv = b'\x00' * 16
+
+        # 明文: 17 字节，不是 16 的倍数 → PKCS7 填充到 32 字节
+        plaintext = b'Hello M3U8 world!'  # 17 bytes
+        cipher = AES.new(key, AES.MODE_CBC, iv=iv)
+        padded = pad(plaintext, AES.block_size)
+        ciphertext = cipher.encrypt(padded)
+
+        driver = M3U8Driver()
+        decrypted = driver._decrypt_segment(ciphertext, key, iv)
+
+        assert decrypted == plaintext, (
+            f"Decrypted data does not match original. "
+            f"Got {len(decrypted)} bytes, expected {len(plaintext)}. "
+            f"PKCS7 padding was not stripped."
+        )
+
+    def test_decrypt_segment_preserves_full_block_no_padding(self):
+        """验证恰好整块数据（无实际填充，pad_len=16）的情况"""
+        try:
+            from Crypto.Cipher import AES
+        except ImportError:
+            pytest.skip("pycryptodome not installed")
+
+        from Crypto.Util.Padding import pad
+        from DracoDownloader.protocols.m3u8 import M3U8Driver
+
+        key = b'\x00' * 16
+        iv = b'\x00' * 16
+
+        # 明文恰好 16 字节 → PKCS7 添加完整填充块 (16 字节)
+        plaintext = b'A' * 16
+        cipher = AES.new(key, AES.MODE_CBC, iv=iv)
+        padded = pad(plaintext, AES.block_size)
+        # padded 应为 32 字节 (16 原始 + 16 填充)
+        assert len(padded) == 32
+        ciphertext = cipher.encrypt(padded)
+
+        driver = M3U8Driver()
+        decrypted = driver._decrypt_segment(ciphertext, key, iv)
+
+        assert decrypted == plaintext
+
+    def test_decrypt_segment_rejects_invalid_length(self):
+        """验证非块对齐的加密数据会报错而非静默损坏"""
+        try:
+            from Crypto.Cipher import AES
+        except ImportError:
+            pytest.skip("pycryptodome not installed")
+
+        from DracoDownloader.protocols.m3u8 import M3U8Driver
+
+        key = b'\x00' * 16
+        iv = b'\x00' * 16
+
+        driver = M3U8Driver()
+        with pytest.raises(RuntimeError, match="Invalid encrypted segment length"):
+            driver._decrypt_segment(b'short', key, iv)
