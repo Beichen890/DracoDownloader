@@ -168,6 +168,9 @@ class M3U8Driver(ProtocolDriver):
             if not segments:
                 raise RuntimeError("未找到可下载的分片")
 
+            # 解析 MEDIA-SEQUENCE（AES-128 无显式 IV 时用作 IV 基数）
+            media_sequence = self._parse_media_sequence(content)
+
             # 5. 创建临时目录
             temp_dir = output_path.parent / f".{output_path.name}.segments"
             temp_dir.mkdir(exist_ok=True)
@@ -184,8 +187,8 @@ class M3U8Driver(ProtocolDriver):
                 # 计算每个分片的 IV（如果未在 EXT-X-KEY 中指定）
                 seg_iv = iv
                 if method == 'AES-128' and seg_iv is None:
-                    # 使用序列号作为 IV (BEP 20 / RFC 8216)
-                    seq = i
+                    # 使用媒体序列号作为 IV (RFC 8216)
+                    seq = media_sequence + i
                     seg_iv = (seq).to_bytes(16, byteorder='big')
 
                 tasks.append(self._download_segment(
@@ -255,6 +258,17 @@ class M3U8Driver(ProtocolDriver):
             if line and not line.startswith('#'):
                 segments.append(line)
         return segments
+
+    def _parse_media_sequence(self, content: str) -> int:
+        """解析 #EXT-X-MEDIA-SEQUENCE（AES-128 无显式 IV 时用作 IV 基数）"""
+        for line in content.split('\n'):
+            line = line.strip()
+            if line.startswith('#EXT-X-MEDIA-SEQUENCE:'):
+                try:
+                    return int(line.split(':', 1)[1])
+                except (ValueError, IndexError):
+                    pass
+        return 0
 
     def _total_duration(self, content: str) -> float:
         """计算总时长"""

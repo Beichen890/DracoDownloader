@@ -699,7 +699,7 @@ class BTDownloader:
                     seek_pos = index * self._piece_length
                     f.seek(seek_pos)
                     f.write(data)
-            except (FileNotFoundError, OSError):
+            except FileNotFoundError:
                 with open(self.output_path, 'wb') as f:
                     f.seek(index * self._piece_length)
                     f.write(data)

@@ -381,3 +381,84 @@ class TestBTDownloaderDataIntegrity:
 
             assert content1 == b'A' * 512
             assert content2 == b'A' * 512
+
+    def test_write_piece_preserves_file_on_oserror(self, tmp_path):
+        """_write_piece must not truncate the output file when write() raises OSError"""
+        from unittest.mock import patch
+        from DracoDownloader.bittorrent.downloader import BTDownloader, Piece, TorrentMeta
+
+        output_path = tmp_path / "output.bin"
+        existing_data = b'\xAA' * 1024
+        output_path.write_bytes(existing_data)
+
+        downloader = BTDownloader.__new__(BTDownloader)
+        downloader.output_path = output_path
+        downloader._piece_length = 512
+        downloader.meta = TorrentMeta(
+            info_hash=b'\x00' * 20,
+            info_hash_hex='00' * 20,
+            name='test',
+            piece_length=512,
+            is_multi_file=False,
+        )
+
+        piece = Piece(index=1, length=512, hash=None)
+        piece.add_block(0, b'A' * 512)
+
+        real_open = open
+
+        class _FailingWriter:
+            """Wraps a real file; write() raises OSError to simulate disk-full."""
+            def __init__(self, f):
+                self._f = f
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                self._f.close()
+            def seek(self, pos, whence=0):
+                self._f.seek(pos, whence)
+            def write(self, data):
+                raise OSError("Disk full")
+
+        def mock_open(path, mode='r', *a, **kw):
+            f = real_open(path, mode, *a, **kw)
+            if 'r+b' in str(mode):
+                return _FailingWriter(f)
+            return f
+
+        with patch('builtins.open', mock_open):
+            with pytest.raises(OSError, match="Disk full"):
+                downloader._write_piece(1, piece)
+
+        # File must not be truncated
+        assert output_path.stat().st_size == 1024
+        assert output_path.read_bytes() == existing_data
+
+
+# ===== M3U8 AES-128 IV 计算 =====
+
+class TestM3U8MediaSequence:
+    def test_parse_media_sequence_present(self):
+        from DracoDownloader.protocols.m3u8 import M3U8Driver
+        driver = M3U8Driver()
+        content = "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:1234\n#EXTINF:10.0,\nseg0.ts\n"
+        assert driver._parse_media_sequence(content) == 1234
+
+    def test_parse_media_sequence_absent(self):
+        from DracoDownloader.protocols.m3u8 import M3U8Driver
+        driver = M3U8Driver()
+        content = "#EXTM3U\n#EXTINF:10.0,\nseg0.ts\n"
+        assert driver._parse_media_sequence(content) == 0
+
+    def test_iv_uses_media_sequence_offset(self):
+        """AES-128 无显式 IV 时应使用 media_sequence + segment_index 作为 IV"""
+        from DracoDownloader.protocols.m3u8 import M3U8Driver
+        driver = M3U8Driver()
+        content = "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:100\n#EXTINF:10.0,\nseg0.ts\n"
+        media_seq = driver._parse_media_sequence(content)
+        # IV for segment 0 should be 100, not 0
+        iv_seg0 = (media_seq + 0).to_bytes(16, byteorder='big')
+        assert iv_seg0 == (100).to_bytes(16, byteorder='big')
+        # IV for segment 1 should be 101
+        iv_seg1 = (media_seq + 1).to_bytes(16, byteorder='big')
+        assert iv_seg1 == (101).to_bytes(16, byteorder='big')
