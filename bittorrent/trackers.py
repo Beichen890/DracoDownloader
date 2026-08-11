@@ -4,8 +4,7 @@ BT Web Tracker 模块
 从公开的 Web Tracker 列表服务获取额外 tracker，与种子自带的 tracker
 合并去重，提高 BT 下载的 peer 发现成功率。
 
-参考 Ghost Downloader 3 的设计，但完全用标准库 + aiohttp 实现，
-不引入第三方 BT 库。
+完全用标准库 + aiohttp 实现，不引入第三方 BT 库。
 """
 
 import asyncio
@@ -145,8 +144,6 @@ def merge_trackers(existing: List[str],
                    web_trackers: List[str],
                    announce_to_all: bool = True) -> List[str]:
     """合并 tracker 列表并去重
-
-    参考Ghost Downloader 3 的 mergeTrackers 设计。
 
     Args:
         existing: 种子自带或 magnet 中的 tracker 列表

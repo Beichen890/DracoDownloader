@@ -123,14 +123,51 @@ class HTTPDriver(ProtocolDriver):
             total=_HTTP_TIMEOUT_TOTAL,
             connect=_HTTP_TIMEOUT_CONNECT
         )
+        # 反爬 HttpClient（由 core 注入，None 时回退到普通 aiohttp session）
+        # 注入后：所有请求自动带真实浏览器 UA、cookie 复用、proxy 生效、Referer 自动注入
+        self._http_client = None
+
+    def _get_session(self) -> aiohttp.ClientSession:
+        """获取 HTTP session
+
+        优先用注入的 HttpClient 的持久 session（带 UA/cookie/proxy/Referer），
+        否则回退到临时 aiohttp.ClientSession（向后兼容）。
+        """
+        if self._http_client is not None and self._http_client._session is not None:
+            return self._http_client.session
+        # 回退：临时 session（无 UA/cookie/proxy）
+        return aiohttp.ClientSession(timeout=self.timeout)
+
+    def _is_shared_session(self) -> bool:
+        """是否使用共享 HttpClient session（决定是否需要 close）"""
+        return (self._http_client is not None
+                and self._http_client._session is not None)
+
+    def _merge_headers(self, extra: Optional[Dict[str, str]] = None,
+                       handle_headers: Optional[Dict[str, str]] = None
+                       ) -> Dict[str, str]:
+        """合并请求头：handle.headers + 用户 extra
+
+        注：UA/cookie/proxy 由 HttpClient 统一管理，这里不重复设置。
+        """
+        headers = {}
+        if handle_headers:
+            headers.update(handle_headers)
+        if extra:
+            headers.update(extra)
+        return headers
 
     def match(self, url: str) -> bool:
         return url.startswith(("http://", "https://"))
 
     async def probe(self, url: str) -> Dict[str, Any]:
         """探测文件信息 (HEAD 请求)"""
-        async with aiohttp.ClientSession(timeout=self.timeout) as session:
-            async with session.head(url) as resp:
+        session = self._get_session()
+        shared = self._is_shared_session()
+        try:
+            # 共享 session 用 HttpClient 的 proxy；临时 session 无 proxy
+            proxy = self._http_client._proxy if shared else None
+            async with session.head(url, proxy=proxy) as resp:
                 if resp.status not in (200, 302, 301):
                     if resp.status == 404:
                         raise FileNotFoundError(f"HTTP 404: {url}")
@@ -143,7 +180,8 @@ class HTTPDriver(ProtocolDriver):
 
             # 如果大小未知，尝试 Range 探测
             if size == 0:
-                async with session.get(url, headers={'Range': 'bytes=0-1'}) as resp:
+                async with session.get(url, headers={'Range': 'bytes=0-1'},
+                                       proxy=proxy) as resp:
                     if resp.status == 206:
                         size = self._parse_content_range(resp.headers.get('content-range', ''))
                         accepts_ranges = True
@@ -165,6 +203,9 @@ class HTTPDriver(ProtocolDriver):
                 'content_type': content_type,
                 'url': url
             }
+        finally:
+            if not shared:
+                await session.close()
 
     async def _auto_optimize_params(self, url: str, size: int,
                                      supports_range: bool) -> tuple:
@@ -243,7 +284,9 @@ class HTTPDriver(ProtocolDriver):
         reporter = _ProgressReporter(total_size, callback, speed_tracker)
 
         try:
-            async with aiohttp.ClientSession(timeout=self.timeout) as session:
+            session = self._get_session()
+            shared = self._is_shared_session()
+            try:
                 semaphore = asyncio.Semaphore(max_conn)
                 tasks = []
                 completed = sum(1 for d in chunks_done if d)
@@ -258,11 +301,15 @@ class HTTPDriver(ProtocolDriver):
                     end = min(start + chunk_size - 1, total_size - 1)
                     tasks.append(self._download_chunk(
                         handle.url, start, end, temp_dir, i,
-                        semaphore, session, reporter, total_size
+                        semaphore, session, reporter, total_size,
+                        handle_headers=handle.headers
                     ))
 
                 if tasks:
                     await asyncio.gather(*tasks)
+            finally:
+                if not shared:
+                    await session.close()
 
             completed = 0
             for i in range(chunk_count):
@@ -355,7 +402,9 @@ class HTTPDriver(ProtocolDriver):
         }
 
         try:
-            async with aiohttp.ClientSession(timeout=self.timeout) as session:
+            session = self._get_session()
+            shared = self._is_shared_session()
+            try:
                 state['session'] = session
                 # 初始 worker：每个分片一个（跳过已完成的）
                 for i, r in enumerate(ranges):
@@ -384,6 +433,9 @@ class HTTPDriver(ProtocolDriver):
                     await monitor
                 except asyncio.CancelledError:
                     pass
+            finally:
+                if not shared:
+                    await session.close()
 
             # 校验完整性
             downloaded_total = sum(r[2] for r in ranges)
@@ -597,7 +649,8 @@ class HTTPDriver(ProtocolDriver):
                               semaphore: asyncio.Semaphore,
                               session: aiohttp.ClientSession,
                               reporter: '_ProgressReporter',
-                              total_size: int):
+                              total_size: int,
+                              handle_headers: Optional[Dict[str, str]] = None):
         """下载单个分片"""
         chunk_file = temp_dir / f"part_{idx:08d}"
         chunk_total = end - start + 1
@@ -607,12 +660,16 @@ class HTTPDriver(ProtocolDriver):
             reporter.update(idx, chunk_file.stat().st_size)
             return
 
+        proxy = self._http_client._proxy if self._is_shared_session() else None
+
         for attempt in range(_CHUNK_RETRIES):
             try:
                 downloaded = 0
                 async with semaphore:
-                    headers = {'Range': f'bytes={start}-{end}'}
-                    async with session.get(url, headers=headers) as resp:
+                    headers = self._merge_headers(
+                        {'Range': f'bytes={start}-{end}'}, handle_headers
+                    )
+                    async with session.get(url, headers=headers, proxy=proxy) as resp:
                         if resp.status not in (200, 206):
                             if resp.status == 416:
                                 # Range not satisfiable → 已完整下载
@@ -639,8 +696,12 @@ class HTTPDriver(ProtocolDriver):
         speed_tracker = _SpeedTracker()
         last_emit = 0.0
 
-        async with aiohttp.ClientSession(timeout=self.timeout) as session:
-            async with session.get(handle.url) as resp:
+        session = self._get_session()
+        shared = self._is_shared_session()
+        proxy = self._http_client._proxy if shared else None
+        try:
+            async with session.get(handle.url, headers=handle.headers or None,
+                                   proxy=proxy) as resp:
                 if resp.status != 200:
                     raise RuntimeError(f"HTTP {resp.status}")
 
@@ -659,6 +720,9 @@ class HTTPDriver(ProtocolDriver):
                 # 确保最终进度到达 100%
                 if callback:
                     callback(downloaded, total_size or downloaded, 0)
+        finally:
+            if not shared:
+                await session.close()
 
     async def resume(self, handle: DownloadHandle,
                      callback: Optional[Callable[[int, int, int], None]] = None):

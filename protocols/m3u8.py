@@ -22,6 +22,44 @@ class M3U8Driver(ProtocolDriver):
     def __init__(self, max_concurrent: int = 16, timeout: int = 30):
         self.max_concurrent = max_concurrent
         self.timeout = aiohttp.ClientTimeout(total=timeout)
+        # 反爬 HttpClient（由 core 注入，None 时回退到普通 aiohttp session）
+        # 注入后：所有请求自动带真实浏览器 UA、cookie 复用、proxy 生效、Referer 自动注入
+        self._http_client = None
+
+    def _get_session(self) -> aiohttp.ClientSession:
+        """获取 HTTP session
+
+        优先用注入的 HttpClient 的持久 session（带 UA/cookie/proxy/Referer），
+        否则回退到临时 aiohttp.ClientSession（向后兼容）。
+        """
+        if self._http_client is not None and self._http_client._session is not None:
+            return self._http_client.session
+        return aiohttp.ClientSession(timeout=self.timeout)
+
+    def _is_shared_session(self) -> bool:
+        """是否使用共享 HttpClient session（决定是否需要 close）"""
+        return (self._http_client is not None
+                and self._http_client._session is not None)
+
+    def _get_proxy(self) -> Optional[str]:
+        """获取代理（仅共享 session 时生效）"""
+        if self._is_shared_session():
+            return self._http_client._proxy
+        return None
+
+    def _merge_headers(self, extra: Optional[Dict[str, str]] = None,
+                       handle_headers: Optional[Dict[str, str]] = None
+                       ) -> Dict[str, str]:
+        """合并请求头：handle.headers + 用户 extra
+
+        注：UA/cookie/proxy 由 HttpClient 统一管理，这里不重复设置。
+        """
+        headers = {}
+        if handle_headers:
+            headers.update(handle_headers)
+        if extra:
+            headers.update(extra)
+        return headers
 
     def match(self, url: str) -> bool:
         # M3U8 以 .m3u8/.m3u 结尾，且是 HTTP 协议
@@ -31,8 +69,11 @@ class M3U8Driver(ProtocolDriver):
 
     async def probe(self, url: str) -> Dict[str, Any]:
         """探测 M3U8 信息"""
-        async with aiohttp.ClientSession(timeout=self.timeout) as session:
-            async with session.get(url) as resp:
+        session = self._get_session()
+        shared = self._is_shared_session()
+        proxy = self._get_proxy()
+        try:
+            async with session.get(url, proxy=proxy) as resp:
                 if resp.status != 200:
                     raise RuntimeError(f"HTTP {resp.status}")
                 content = await resp.text()
@@ -41,7 +82,7 @@ class M3U8Driver(ProtocolDriver):
             if '#EXT-X-STREAM-INF' in content:
                 variant_url = self._find_best_variant(content, url)
                 if variant_url:
-                    async with session.get(variant_url) as resp2:
+                    async with session.get(variant_url, proxy=proxy) as resp2:
                         content = await resp2.text()
 
             segments = self._parse_segments(content, url)
@@ -56,7 +97,7 @@ class M3U8Driver(ProtocolDriver):
                     seg_url = segments[0]
                     if not seg_url.startswith('http'):
                         seg_url = urljoin(self._base_url(url), seg_url)
-                    async with session.head(seg_url) as resp:
+                    async with session.head(seg_url, proxy=proxy) as resp:
                         first_seg_size = int(resp.headers.get('content-length', 0))
                 except Exception:
                     pass
@@ -70,6 +111,9 @@ class M3U8Driver(ProtocolDriver):
                 'first_segment_size': first_seg_size,
                 'filename': url.split('/')[-1].replace('.m3u8', '.mp4').replace('.m3u', '.mp4')
             }
+        finally:
+            if not shared:
+                await session.close()
 
     def _parse_key_info(self, content: str, base_url: str) -> Tuple[Optional[str], Optional[str], Optional[bytes]]:
         """解析 #EXT-X-KEY 信息"""
@@ -108,9 +152,10 @@ class M3U8Driver(ProtocolDriver):
         return ('NONE', None, None)
 
     async def _download_key(self, session: aiohttp.ClientSession,
-                            key_uri: str) -> bytes:
+                            key_uri: str,
+                            proxy: Optional[str] = None) -> bytes:
         """下载 AES-128 密钥"""
-        async with session.get(key_uri) as resp:
+        async with session.get(key_uri, proxy=proxy) as resp:
             if resp.status != 200:
                 raise RuntimeError(f"Failed to download AES key: HTTP {resp.status}")
             return await resp.read()
@@ -137,16 +182,21 @@ class M3U8Driver(ProtocolDriver):
         url = handle.url
         base_url = self._base_url(url)
 
-        async with aiohttp.ClientSession(timeout=self.timeout) as session:
+        session = self._get_session()
+        shared = self._is_shared_session()
+        proxy = self._get_proxy()
+        try:
             # 1. 获取主清单
-            async with session.get(url) as resp:
+            async with session.get(url, proxy=proxy) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"HTTP {resp.status}")
                 content = await resp.text()
 
             # 2. 如果是主清单，选最佳子清单
             if '#EXT-X-STREAM-INF' in content:
                 variant_url = self._find_best_variant(content, url)
                 if variant_url:
-                    async with session.get(variant_url) as resp2:
+                    async with session.get(variant_url, proxy=proxy) as resp2:
                         content = await resp2.text()
                     base_url = self._base_url(variant_url)
 
@@ -154,12 +204,10 @@ class M3U8Driver(ProtocolDriver):
             method, key_uri, iv = self._parse_key_info(content, base_url)
             aes_key = None
             if method == 'AES-128' and key_uri:
-                log_key = getattr(self, '_log', None)
-                # 使用模块级 logger
                 from ..logger import get_logger
                 logger = get_logger('m3u8')
                 logger.info(f"AES-128 encrypted stream, downloading key: {key_uri[:60]}")
-                aes_key = await self._download_key(session, key_uri)
+                aes_key = await self._download_key(session, key_uri, proxy=proxy)
                 if len(aes_key) != 16:
                     raise RuntimeError(f"Invalid AES key length: {len(aes_key)} (expected 16)")
 
@@ -191,7 +239,8 @@ class M3U8Driver(ProtocolDriver):
                 tasks.append(self._download_segment(
                     session, seg_url, temp_dir, i, semaphore,
                     callback, total_segments, i + 1,
-                    aes_key=aes_key, iv=seg_iv
+                    aes_key=aes_key, iv=seg_iv,
+                    proxy=proxy, handle_headers=handle.headers
                 ))
 
             await asyncio.gather(*tasks)
@@ -206,6 +255,9 @@ class M3U8Driver(ProtocolDriver):
 
             # 8. 清理
             shutil.rmtree(temp_dir, ignore_errors=True)
+        finally:
+            if not shared:
+                await session.close()
 
     async def _download_segment(self, session: aiohttp.ClientSession,
                                 url: str, temp_dir: Path, idx: int,
@@ -213,17 +265,23 @@ class M3U8Driver(ProtocolDriver):
                                 callback: Optional[Callable],
                                 total: int, current: int,
                                 aes_key: Optional[bytes] = None,
-                                iv: Optional[bytes] = None):
+                                iv: Optional[bytes] = None,
+                                proxy: Optional[str] = None,
+                                handle_headers: Optional[Dict[str, str]] = None):
         """下载单个 TS 分片（可选 AES-128 解密）"""
         output_file = temp_dir / f"segment_{idx:08d}.ts"
 
         if output_file.exists() and output_file.stat().st_size > 0:
             return
 
+        # 合并 handle.headers（UA/cookie/proxy 由 HttpClient 统一管理）
+        req_headers = self._merge_headers(handle_headers=handle_headers) or None
+
         for attempt in range(3):
             try:
                 async with semaphore:
-                    async with session.get(url) as resp:
+                    async with session.get(url, headers=req_headers,
+                                           proxy=proxy) as resp:
                         if resp.status != 200:
                             raise RuntimeError(f"HTTP {resp.status}")
 
