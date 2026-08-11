@@ -2,7 +2,7 @@
 BT 做种策略
 
 下载完成后根据分享率 / 时长决定何时停止做种。
-参考 Ghost Downloader 3 的双限速策略，用纯 asyncio 实现。
+用纯 asyncio 实现双限速策略。
 """
 
 import asyncio

@@ -20,6 +20,13 @@ from .mirror_selector import (
     MIRROR_CATEGORIES, MirrorProbeResult
 )
 from .optimizer import DownloadOptimizer, OptimalParams
+from .http_client import HttpClient, AntiBotError
+from .sniffer import ResourceSniffer, SniffResult, is_direct_link, classify_url
+from .errors import (
+    DracoError, make_error, ERR_ANTI_BOT, ERR_SNIFF_FAILED,
+    ERR_NO_DIRECT_URL, sniff_failed_error, no_direct_url_error,
+    anti_bot_error,
+)
 
 log = get_logger('core')
 
@@ -36,6 +43,7 @@ class DownloadResult:
     error: Optional[str] = None
     mirror_used: Optional[str] = None   # 使用的镜像
     optimization: Optional[Dict[str, Any]] = None  # 优化信息
+    sniffed: Optional[Dict[str, Any]] = None  # 探嗅信息（原URL→直链）
 
 
 @dataclass
@@ -55,6 +63,11 @@ class DracoDownloader:
                  auto_optimize: bool = True,
                  auto_mirror: bool = False,
                  mirror_region: str = "cn",
+                 auto_sniff: bool = True,
+                 proxy: Optional[str] = None,
+                 user_agent: Optional[str] = None,
+                 rotate_ua: bool = True,
+                 mobile_ua: bool = False,
                  optimizer: Optional[DownloadOptimizer] = None,
                  mirror_selector: Optional[SmartMirrorDownloader] = None):
         """
@@ -63,6 +76,11 @@ class DracoDownloader:
             auto_optimize: 是否自动优化分片/线程参数
             auto_mirror: 是否自动选择最优镜像站
             mirror_region: 镜像区域 ("cn", "global", "auto")
+            auto_sniff: 是否自动探嗅非直链（页面 URL → 直链）
+            proxy: 全局代理（http://或 socks5://，socks5 需 aiohttp-socks）
+            user_agent: 固定 UA（None 时按 rotate_ua 轮换真实浏览器 UA）
+            rotate_ua: 是否每次请求轮换 UA
+            mobile_ua: 使用移动端 UA 池
             optimizer: 自定义优化器
             mirror_selector: 自定义镜像选择器
         """
@@ -73,6 +91,18 @@ class DracoDownloader:
         self.auto_optimize = auto_optimize
         self.auto_mirror = auto_mirror
         self.mirror_region = mirror_region
+        self.auto_sniff = auto_sniff
+
+        # 全局反爬 HttpClient（持久 session + UA 轮换 + cookie 复用）
+        self._http_client = HttpClient(
+            proxy=proxy,
+            user_agent=user_agent,
+            rotate_ua=rotate_ua,
+            mobile_ua=mobile_ua,
+        )
+
+        # 资源探嗅器（共享 HttpClient，带反爬能力）
+        self._sniffer = ResourceSniffer(http_client=self._http_client)
 
         # 镜像选择器
         self._mirror_selector = mirror_selector
@@ -84,7 +114,7 @@ class DracoDownloader:
         if self.auto_optimize and self._optimizer is None:
             self._optimizer = DownloadOptimizer()
 
-        # 将优化器注入到 HTTP 驱动
+        # 将优化器和 HttpClient 注入到协议驱动
         self._inject_optimizer()
 
         # 注册调度器执行器
@@ -92,16 +122,39 @@ class DracoDownloader:
 
         from DracoDownloader import __version__
         log.info(f"DracoDownloader v{__version__} initialized "
-                 f"(optimize={auto_optimize}, mirror={auto_mirror})")
+                 f"(optimize={auto_optimize}, mirror={auto_mirror}, "
+                 f"sniff={auto_sniff}, proxy={'on' if proxy else 'off'})")
+
+    async def __aenter__(self):
+        """async context manager 支持"""
+        await self._http_client.start()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        await self._http_client.close()
+
+    async def start(self):
+        """显式启动（非 async with 场景）"""
+        await self._http_client.start()
+
+    async def close(self):
+        """显式关闭（释放持久 session）"""
+        await self._http_client.close()
 
     def _inject_optimizer(self):
-        """将优化器和镜像器注入到协议驱动中"""
+        """将优化器和 HttpClient 注入到协议驱动中"""
+        from .protocols.m3u8 import M3U8Driver
         for driver in self.router._drivers:
             if isinstance(driver, HTTPDriver):
                 if self._optimizer and self.auto_optimize:
                     driver._optimizer = self._optimizer
                 if self.auto_optimize:
                     driver.auto_optimize = True
+                # 注入共享 HttpClient（UA/cookie/proxy 复用）
+                driver._http_client = self._http_client
+            elif isinstance(driver, M3U8Driver):
+                # M3U8 同样注入共享 HttpClient（UA/cookie/proxy/Referer 复用）
+                driver._http_client = self._http_client
 
     async def _resolve_mirror_url(self, url: str) -> tuple[str, Optional[str]]:
         """
@@ -135,6 +188,85 @@ class DracoDownloader:
             log.warning(f"镜像选择失败，使用原始URL: {e}")
 
         return url, None
+
+    async def sniff(self, url: str,
+                    headers: Optional[Dict[str, str]] = None) -> SniffResult:
+        """主动探嗅 URL，返回直链列表
+
+        Agent 可在下载前调用此方法预览页面包含的资源，
+        选择目标直链后再调 download_async。
+
+        Args:
+            url: 任意 URL（直链或页面）
+            headers: 额外请求头（如 Referer/Cookie）
+
+        Returns:
+            SniffResult，含 direct_urls 列表和 best 便捷属性
+        """
+        # 确保 HttpClient 已启动
+        if self._http_client._session is None:
+            await self._http_client.start()
+        return await self._sniffer.sniff(url, headers=headers)
+
+    async def _resolve_direct_url(self, url: str,
+                                  headers: Optional[Dict[str, str]] = None
+                                  ) -> tuple[str, Optional[Dict[str, Any]]]:
+        """将任意 URL 解析为直链
+
+        若 url 本身是直链（含可识别后缀/协议），直接返回。
+        否则触发探嗅，返回置信度最高的直链。
+
+        Returns:
+            (direct_url, sniff_info)  sniff_info 含原URL/类型/标签等，None 表示未探嗅
+        """
+        # 1. 直链直接返回
+        if is_direct_link(url):
+            return url, None
+
+        # 2. 非 HTTP/HTTPS 协议不探嗅（BT/magnet/ftp 等按原逻辑）
+        if not url.startswith(('http://', 'https://')):
+            return url, None
+
+        # 3. 探嗅
+        log.info(f"非直链，启动探嗅: {url}")
+        try:
+            result = await self.sniff(url, headers=headers)
+        except AntiBotError as e:
+            raise anti_bot_error(
+                e.status, url,
+                hint="探嗅阶段被拦截，尝试换 UA/加 cookie/换代理"
+            ) from e
+        except Exception as e:
+            raise sniff_failed_error(str(e)) from e
+
+        if not result.direct_urls:
+            raise no_direct_url_error(url)
+
+        best = result.best
+        if best is None:
+            raise no_direct_url_error(url)
+
+        log.info(f"探嗅命中: {best.url} (type={best.type.value}, "
+                 f"source={best.source}, conf={best.confidence:.2f})")
+
+        # 记住页面 URL，后续分片下载自动带 Referer（防盗链）
+        self._http_client.remember_page(result.original_url)
+
+        sniff_info = {
+            'original_url': result.original_url,
+            'direct_url': best.url,
+            'type': best.type.value,
+            'label': best.label,
+            'source': best.source,
+            'confidence': best.confidence,
+            'page_title': result.page_title,
+            'all_candidates': [
+                {'url': r.url, 'type': r.type.value, 'label': r.label,
+                 'confidence': r.confidence}
+                for r in result.direct_urls
+            ],
+        }
+        return best.url, sniff_info
 
     def download(self, url: str, output_path: str,
                  headers: Optional[Dict[str, str]] = None,
@@ -178,7 +310,15 @@ class DracoDownloader:
 
         output_path = str(Path(output_path).resolve())
 
-        resolved_url, mirror_name = await self._resolve_mirror_url(url)
+        # 探嗅：非直链自动解析为直链
+        try:
+            sniffed_url, sniff_info = await self._resolve_direct_url(url, headers)
+        except DracoError as e:
+            yield ProgressEvent(progress=0, speed=0, downloaded=0, total=0,
+                                message=e.message)
+            return
+
+        resolved_url, mirror_name = await self._resolve_mirror_url(sniffed_url)
 
         driver = self.router.route(resolved_url)
         if driver is None:
@@ -213,6 +353,8 @@ class DracoDownloader:
                     if event.progress >= 100:
                         if mirror_name:
                             log.info(f"流式下载完成，使用镜像: {mirror_name}")
+                        if sniff_info:
+                            log.info(f"探嗅命中: {sniff_info['direct_url']}")
                         break
                 except asyncio.TimeoutError:
                     if download_task.done():
@@ -321,8 +463,17 @@ class DracoDownloader:
         output_path = str(Path(output_path).resolve())
         log.info(f"Download: {url[:80]} -> {output_path}")
 
-        # 镜像解析
-        resolved_url, mirror_name = await self._resolve_mirror_url(url)
+        # 探嗅：非直链自动解析为直链
+        sniff_info: Optional[Dict[str, Any]] = None
+        try:
+            sniffed_url, sniff_info = await self._resolve_direct_url(url, headers)
+        except DracoError as e:
+            return DownloadResult(
+                success=False, path=output_path, error=e.message
+            )
+
+        # 镜像解析（在直链基础上）
+        resolved_url, mirror_name = await self._resolve_mirror_url(sniffed_url)
 
         driver = self.router.route(resolved_url)
         if driver is None:
@@ -336,7 +487,7 @@ class DracoDownloader:
             url=resolved_url,
             output_path=output_path,
             headers=headers or {},
-            proxy=proxy
+            proxy=proxy or self._http_client._proxy
         )
 
         # 将外部回调传递到 handle，供 _execute_download 使用
@@ -371,6 +522,10 @@ class DracoDownloader:
             # 附加镜像信息
             if mirror_name:
                 result.mirror_used = mirror_name
+
+            # 附加探嗅信息
+            if sniff_info:
+                result.sniffed = sniff_info
 
             return result
 

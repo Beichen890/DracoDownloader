@@ -6,8 +6,8 @@ BT 多源加载器
 - HTTP/HTTPS URL 指向的 .torrent
 - 磁力链接 (magnet:)
 
-参考 Ghost Downloader 3 的 loaders.py 设计，但用纯自研 BT 栈，
-不依赖 libtorrent。磁力链接的元数据通过 DHT + Peer Wire Protocol 获取。
+纯自研 BT 栈，不依赖 libtorrent。
+磁力链接的元数据通过 DHT + Peer Wire Protocol 获取。
 """
 
 import asyncio

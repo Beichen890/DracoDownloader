@@ -27,6 +27,9 @@ ERR_BT_METADATA = "draco.bt.metadata"
 ERR_BT_INVALID_TORRENT = "draco.bt.invalid_torrent"
 ERR_M3U8_PARSE = "draco.m3u8.parse"
 ERR_M3U8_DECRYPT = "draco.m3u8.decrypt"
+ERR_ANTI_BOT = "draco.anti_bot"
+ERR_SNIFF_FAILED = "draco.sniff_failed"
+ERR_NO_DIRECT_URL = "draco.no_direct_url"
 
 
 # 可翻译消息表（key = 错误码, value = 默认中文消息）
@@ -49,6 +52,9 @@ _DEFAULT_MESSAGES: Dict[str, str] = {
     ERR_BT_INVALID_TORRENT: "无效的 torrent 文件: {detail}",
     ERR_M3U8_PARSE: "M3U8 解析失败: {detail}",
     ERR_M3U8_DECRYPT: "M3U8 AES-128 解密失败: {detail}",
+    ERR_ANTI_BOT: "反爬拦截 (HTTP {status}): {url}（{hint}）",
+    ERR_SNIFF_FAILED: "资源探嗅失败: {detail}",
+    ERR_NO_DIRECT_URL: "未探嗅到可下载直链: {url}",
 }
 
 
@@ -60,6 +66,7 @@ _RETRYABLE_CODES = {
     ERR_DOWNLOAD_FAILED,
     ERR_BT_NO_PEERS,
     ERR_BT_METADATA,
+    ERR_ANTI_BOT,
 }
 
 
@@ -168,6 +175,25 @@ def m3u8_decrypt_error(detail: str) -> DracoError:
     return make_error(ERR_M3U8_DECRYPT, detail=detail)
 
 
+def anti_bot_error(status: int, url: str, hint: str = "") -> DracoError:
+    """反爬拦截错误
+
+    Args:
+        status: HTTP 状态码（401/403/429）
+        url: 触发反爬的 URL
+        hint: 给 Agent 的处理建议（如 "换 UA/加 cookie/换代理"）
+    """
+    return make_error(ERR_ANTI_BOT, status=status, url=url, hint=hint)
+
+
+def sniff_failed_error(detail: str) -> DracoError:
+    return make_error(ERR_SNIFF_FAILED, detail=detail)
+
+
+def no_direct_url_error(url: str) -> DracoError:
+    return make_error(ERR_NO_DIRECT_URL, url=url)
+
+
 __all__ = [
     "DracoError",
     "make_error",
@@ -189,6 +215,9 @@ __all__ = [
     "ERR_BT_INVALID_TORRENT",
     "ERR_M3U8_PARSE",
     "ERR_M3U8_DECRYPT",
+    "ERR_ANTI_BOT",
+    "ERR_SNIFF_FAILED",
+    "ERR_NO_DIRECT_URL",
     # 便捷工厂
     "unsupported_protocol",
     "http_status_error",
@@ -203,4 +232,7 @@ __all__ = [
     "bt_invalid_torrent",
     "m3u8_parse_error",
     "m3u8_decrypt_error",
+    "anti_bot_error",
+    "sniff_failed_error",
+    "no_direct_url_error",
 ]
