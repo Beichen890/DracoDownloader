@@ -14,7 +14,9 @@ from pathlib import Path
 from typing import Optional, Dict, Any, Callable
 
 from .base import ProtocolDriver, DownloadHandle
-from ..optimizer import DownloadOptimizer, OptimalParams, NetworkProfile
+from ..optimizer import (
+    DownloadOptimizer, OptimalParams, NetworkProfile, AdaptiveSpeedupController,
+)
 
 # === 常量定义 ===
 _DEFAULT_MAX_CONNECTIONS = 64
@@ -106,13 +108,17 @@ class HTTPDriver(ProtocolDriver):
     def __init__(self, max_connections: int = _DEFAULT_MAX_CONNECTIONS,
                  chunk_size: int = _DEFAULT_CHUNK_SIZE,
                  auto_optimize: bool = True,
-                 optimizer: Optional[DownloadOptimizer] = None):
+                 optimizer: Optional[DownloadOptimizer] = None,
+                 adaptive: bool = True):
         self.max_connections = max_connections
         self.chunk_size = chunk_size
         self.auto_optimize = auto_optimize
         self._optimizer = optimizer
         self._optimal_params: Optional[OptimalParams] = None
         self._network_profile: Optional[NetworkProfile] = None
+        # 运行时自适应加速（免合并 + 动态分裂最慢分片）
+        self.adaptive = adaptive
+        self._adaptive_controller: Optional[AdaptiveSpeedupController] = None
         self.timeout = aiohttp.ClientTimeout(
             total=_HTTP_TIMEOUT_TOTAL,
             connect=_HTTP_TIMEOUT_CONNECT
@@ -207,6 +213,17 @@ class HTTPDriver(ProtocolDriver):
             await self._download_single(handle, callback)
             return
 
+        # 优先尝试自适应路径（免合并 + 运行时分裂最慢分片）
+        # 失败则回退到原"分片落盘 + 合并"路径
+        if self.adaptive and supports_range and total_size > 0:
+            try:
+                await self._download_adaptive(handle, callback,
+                                              opt_shards, opt_connections,
+                                              opt_chunk_size, use_optimized)
+                return
+            except Exception as e:
+                log.warning(f"自适应下载失败，回退到合并路径: {e}")
+
         if use_optimized:
             chunk_count = opt_shards or self._calculate_chunks(total_size)
             chunk_size = opt_chunk_size or math.ceil(total_size / chunk_count)
@@ -266,6 +283,298 @@ class HTTPDriver(ProtocolDriver):
         except Exception:
             self._cleanup_temp_dir(temp_dir)
             raise
+
+    async def _download_adaptive(self, handle: DownloadHandle,
+                                 callback: Optional[Callable[[int, int, int], None]],
+                                 opt_shards: Optional[int],
+                                 opt_connections: Optional[int],
+                                 opt_chunk_size: Optional[int],
+                                 use_optimized: bool) -> None:
+        """自适应下载路径：免合并定位写 + 运行时分裂最慢分片
+
+        与传统"分片落临时文件 → 合并"不同，本路径：
+        1. 预分配目标文件（ftruncate）
+        2. 各 worker 用 os.pwrite 直接写最终文件的对应偏移，零合并
+        3. AdaptiveSpeedupController 监控速度，速度稳定时把最慢分片的
+           剩余区间一分为二，新增 worker 接管后半段
+
+        断点续传：用 .progress 文件记录每个分片的已写字节，恢复时跳过已写部分。
+        """
+        output_path = Path(handle.output_path)
+        total_size = handle.total_size
+        url = handle.url
+
+        chunk_count = opt_shards or self._calculate_chunks(total_size)
+        chunk_size = opt_chunk_size or math.ceil(total_size / chunk_count)
+        max_conn = opt_connections or self.max_connections
+
+        # 预分配文件
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(output_path), os.O_RDWR | os.O_CREAT, 0o666)
+        try:
+            try:
+                os.ftruncate(fd, total_size)
+            except OSError as e:
+                log.warning(f"预分配失败，降级为稀疏写: {e}")
+        except Exception:
+            os.close(fd)
+            raise
+
+        # 分片区间表（闭区间 [start, end]）
+        # 初始等分；运行时由控制器分裂
+        ranges: list[list[int]] = []  # [start, end, downloaded]
+        progress_file = Path(f"{output_path}.progress")
+        saved = self._load_adaptive_progress(progress_file, chunk_count)
+        for i in range(chunk_count):
+            start = i * chunk_size
+            end = min(start + chunk_size - 1, total_size - 1)
+            ranges.append([start, end, saved[i] if i < len(saved) else 0])
+
+        speed_tracker = _SpeedTracker()
+        reporter = _ProgressReporter(total_size, callback, speed_tracker)
+
+        if self._adaptive_controller is None:
+            self._adaptive_controller = AdaptiveSpeedupController()
+        else:
+            self._adaptive_controller.reset()
+
+        # 共享状态
+        state = {
+            'ranges': ranges,
+            'fd': fd,
+            'url': url,
+            'semaphore': asyncio.Semaphore(max_conn),
+            'reporter': reporter,
+            'speed_tracker': speed_tracker,
+            'active_workers': 0,
+            'lock': asyncio.Lock(),
+            'session': None,
+            'progress_path': str(progress_file),
+        }
+
+        try:
+            async with aiohttp.ClientSession(timeout=self.timeout) as session:
+                state['session'] = session
+                # 初始 worker：每个分片一个（跳过已完成的）
+                tasks = []
+                for i, r in enumerate(ranges):
+                    if r[2] >= (r[1] - r[0] + 1):
+                        reporter.update(i, r[1] - r[0] + 1)
+                        continue
+                    tasks.append(asyncio.create_task(
+                        self._adaptive_worker(i, state, session)
+                    ))
+
+                # 监控任务：定期喂速度采样给控制器，按需分裂最慢分片
+                monitor = asyncio.create_task(
+                    self._adaptive_monitor(state, callback)
+                )
+
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+
+                monitor.cancel()
+                try:
+                    await monitor
+                except asyncio.CancelledError:
+                    pass
+
+            # 校验完整性
+            downloaded_total = sum(r[2] for r in ranges)
+            if downloaded_total < total_size:
+                raise RuntimeError(
+                    f"自适应下载不完整: {downloaded_total}/{total_size} bytes"
+                )
+
+            # 保存断点已无意义，删除
+            progress_file.unlink(missing_ok=True)
+            if callback:
+                callback(total_size, total_size, 0)
+
+            # 反馈实际速度给优化器（修正后续同站优化）
+            if self._optimizer is not None and self._network_profile is not None:
+                speed_bps = speed_tracker.get_speed()
+                if speed_bps > 0:
+                    self._optimizer.record_actual(
+                        url, self._network_profile,
+                        (speed_bps * 8) / 1_000_000, total_size
+                    )
+        finally:
+            os.close(fd)
+
+    async def _adaptive_worker(self, idx: int, state: dict,
+                               session: aiohttp.ClientSession) -> None:
+        """单个自适应分片下载 worker
+
+        下载 ranges[idx] 对应的区间，用 os.pwrite 定位写入。
+        """
+        ranges = state['ranges']
+        fd = state['fd']
+        url = state['url']
+        semaphore = state['semaphore']
+        reporter = state['reporter']
+        chunk_size = self.chunk_size
+
+        async with semaphore:
+            async with state['lock']:
+                state['active_workers'] += 1
+
+            try:
+                while True:
+                    async with state['lock']:
+                        r = ranges[idx]
+                        start, end, downloaded = r[0], r[1], r[2]
+                        remaining = end - start + 1 - downloaded
+                        if remaining <= 0:
+                            break
+                        http_start = start + downloaded
+                        http_end = end
+
+                    headers = {'Range': f'bytes={http_start}-{http_end}'}
+                    try:
+                        async with session.get(url, headers=headers) as resp:
+                            if resp.status not in (200, 206):
+                                if resp.status == 416:
+                                    async with state['lock']:
+                                        ranges[idx][2] = end - start + 1
+                                        reporter.update(idx, ranges[idx][2])
+                                    return
+                                raise RuntimeError(f"HTTP {resp.status}")
+                            offset = http_start
+                            async for data in resp.content.iter_chunked(chunk_size):
+                                if not data:
+                                    continue
+                                # 定位写：直接写最终文件偏移，零合并
+                                os.pwrite(fd, data, offset)
+                                offset += len(data)
+                                async with state['lock']:
+                                    ranges[idx][2] += len(data)
+                                    reporter.update(idx, ranges[idx][2])
+                                    state['speed_tracker'].add(
+                                        sum(rr[2] for rr in ranges)
+                                    )
+                    except (ConnectionError, OSError, asyncio.TimeoutError) as e:
+                        log.debug(f"分片 {idx} 错误，重试: {e}")
+                        await asyncio.sleep(1)
+                        continue
+            finally:
+                async with state['lock']:
+                    state['active_workers'] -= 1
+
+    async def _adaptive_monitor(self, state: dict,
+                                callback: Optional[Callable[[int, int, int], None]]) -> None:
+        """监控任务：定期采样速度，速度稳定时分裂最慢分片
+
+        每 1 秒喂一次速度采样给 AdaptiveSpeedupController。
+        当控制器要求分裂时，选剩余字节最多的分片，把它的 [start, end]
+        一分为二，缩小原分片 end，新增一个 worker 接管后半段。
+        """
+        ranges = state['ranges']
+        reporter = state['reporter']
+        controller = self._adaptive_controller
+        if controller is None:
+            return
+
+        last_save = 0.0
+        while True:
+            await asyncio.sleep(1.0)
+            loop_time = asyncio.get_event_loop().time()
+            speed = state['speed_tracker'].get_speed()
+
+            async with state['lock']:
+                active = state['active_workers']
+                # 选剩余字节最多的分片作为分裂候选
+                candidates = []
+                for i, r in enumerate(ranges):
+                    remaining = r[1] - r[0] + 1 - r[2]
+                    if remaining > controller.min_split_bytes:
+                        candidates.append((remaining, i))
+                candidates.sort(reverse=True)
+
+            split_count = 0
+            # 首次触发时 controller 通过 feed 返回（当前实现返回空列表，
+            # 由本方法直接选候选）；这里统一用候选数限制
+            should_split = controller.feed(speed, active, loop_time)
+            # controller.feed 首次触发后 _observe_started_at != 0，
+            # 我们在首次触发时主动分裂 split_on_trigger 个
+            if (controller._observe_started_at != 0
+                    and controller._baseline_workers == active
+                    and not getattr(controller, '_initial_split_done', False)):
+                split_count = min(controller.split_on_trigger,
+                                  len(candidates),
+                                  controller.max_workers - active)
+                controller._initial_split_done = True
+            elif should_split:
+                split_count = len(should_split)
+
+            for _ in range(split_count):
+                if not candidates:
+                    break
+                _, idx = candidates.pop(0)
+                async with state['lock']:
+                    r = ranges[idx]
+                    start, end, downloaded = r[0], r[1], r[2]
+                    # 只分裂未下载部分的尾部
+                    split_at = AdaptiveSpeedupController.split_range(
+                        start + downloaded, end
+                    )
+                    if split_at is None:
+                        continue
+                    new_start, new_end = split_at
+                    # 缩小原分片 end 到分裂点前
+                    ranges[idx][1] = new_start - 1
+                    # 新增分片
+                    new_idx = len(ranges)
+                    ranges.append([new_start, new_end, 0])
+                    log.debug(f"分裂分片 {idx} → 新分片 {new_idx} "
+                              f"[{new_start},{new_end}]")
+                # 启动新 worker（需重新获取 session）
+                # 这里复用 state 中没有 session，简化为创建新任务由调用方 session 池
+                # 实际通过外部 session 引用启动
+                state.setdefault('pending_spawns', []).append(new_idx)
+
+            # 处理待启动的 worker
+            spawns = state.pop('pending_spawns', []) if 'pending_spawns' in state else []
+            for new_idx in spawns:
+                session = state.get('session')
+                if session is not None:
+                    asyncio.create_task(
+                        self._adaptive_worker(new_idx, state, session)
+                    )
+
+            # 定期保存断点
+            now = asyncio.get_event_loop().time()
+            if now - last_save > 2.0:
+                async with state['lock']:
+                    self._save_adaptive_progress(
+                        Path(state['progress_path']), ranges
+                    )
+                last_save = now
+
+    def _load_adaptive_progress(self, path: Path, count: int) -> list[int]:
+        """加载自适应断点（每分片已写字节数）"""
+        if not path.exists():
+            return [0] * count
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            saved = data.get('adaptive_bytes', [])
+            return saved[:count] + [0] * max(0, count - len(saved))
+        except (json.JSONDecodeError, FileNotFoundError, OSError):
+            return [0] * count
+
+    def _save_adaptive_progress(self, path: Path,
+                                ranges: list[list[int]]) -> None:
+        """保存自适应断点（每分片已写字节数 + 区间）"""
+        try:
+            with open(path, 'w') as f:
+                json.dump({
+                    'adaptive_bytes': [r[2] for r in ranges],
+                    'ranges': [[r[0], r[1]] for r in ranges],
+                    'updated': time.time(),
+                }, f)
+        except OSError:
+            pass
 
     def _cleanup_temp_dir(self, temp_dir: Path):
         """清理临时目录"""

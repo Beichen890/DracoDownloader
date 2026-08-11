@@ -9,7 +9,7 @@ import asyncio
 import time
 import os
 import math
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List
 from dataclasses import dataclass, field
 
 from .logger import get_logger
@@ -409,6 +409,8 @@ class DownloadOptimizer:
         self.thread_calculator = thread_calculator or OptimalThreadCalculator()
         self.auto_probe = auto_probe
         self._last_profile: Optional[NetworkProfile] = None
+        # 按域名记忆的历史实际带宽（运行时反馈修正）
+        self._host_bandwidth: Dict[str, float] = {}
 
     async def optimize_for_url(self,
                                url: str,
@@ -472,3 +474,203 @@ class DownloadOptimizer:
         """
         params = await self.optimize_for_url(url, file_size)
         return (params.shard_count, params.thread_count)
+
+    # ── 运行时反馈：用历史实际速度修正后续优化 ──
+
+    def record_actual(self, url: str, profile: NetworkProfile,
+                      actual_speed_mbps: float, file_size: int) -> None:
+        """下载完成后回填实际速度，供后续优化参考
+
+        下载前的 NetworkProfile 来自短时探测，置信度有限。
+        下载完成后用整段下载的实际吞吐量修正画像，使后续同站下载更准。
+
+        Args:
+            url: 目标URL（取域名做记忆键）
+            profile: 本次下载使用的网络画像
+            actual_speed_mbps: 实际平均速度（Mbps）
+            file_size: 文件大小（字节）
+        """
+        if actual_speed_mbps <= 0:
+            return
+        host = self._host_of(url)
+        # 实际速度可信度高（整段下载平均），用指数加权融合
+        prev = self._host_bandwidth.get(host)
+        if prev is None:
+            fused = actual_speed_mbps
+        else:
+            fused = 0.6 * actual_speed_mbps + 0.4 * prev
+        self._host_bandwidth[host] = fused
+        self._last_profile = profile
+        log.debug(f"记录实际带宽 {host}: {actual_speed_mbps:.1f}Mbps → 融合 {fused:.1f}Mbps")
+
+    def profile_for(self, url: str) -> Optional[NetworkProfile]:
+        """获取该 URL 域名的历史画像（若有）"""
+        host = self._host_of(url)
+        bw = self._host_bandwidth.get(host)
+        if bw is None or self._last_profile is None:
+            return None
+        return NetworkProfile(
+            latency_ms=self._last_profile.latency_ms,
+            bandwidth_mbps=bw,
+            bandwidth_confidence=0.8,
+            loss_rate=self._last_profile.loss_rate,
+            supports_range=self._last_profile.supports_range,
+            download_speed_bps=int(bw * 1_000_000 / 8),
+        )
+
+    @staticmethod
+    def _host_of(url: str) -> str:
+        try:
+            return url.split("//", 1)[1].split("/", 1)[0].split(":", 1)[0]
+        except (IndexError, AttributeError):
+            return url
+
+
+class AdaptiveSpeedupController:
+    """运行时自适应加速控制器
+
+    下载前的 OptimalParams 来自短时探测，是静态推荐。
+    本控制器在下载运行时持续采样实际速度，当速度稳定时
+    动态分裂"最慢的分片"，把它的剩余区间一分为二，新增
+    一个 worker 接管后半段，实现负载自均衡。
+
+    判定逻辑（启发式，非 ML）：
+    1. 维护最近 ``sample_size`` 个速度采样
+    2. 速度稳定（最大偏差 ≤ ``stability_threshold``）才考虑加速
+    3. 首次触发：记录基线（worker 数、速度），分裂若干次最慢分片
+    4. 观察期后对比：worker 增比 vs 速度增比
+       - 速度增比 ≥ worker 增比 × 加速收益系数 → 继续加速
+       - 否则 → 停止自动加速（再分裂已无收益）
+
+    线程安全：单事件循环内由 HTTPDriver 协程驱动，不跨线程。
+    """
+
+    def __init__(self,
+                 sample_size: int = 5,
+                 stability_threshold: float = 0.15,
+                 observe_seconds: float = 5.0,
+                 split_on_trigger: int = 4,
+                 benefit_ratio: float = 0.8,
+                 max_workers: int = 64,
+                 min_split_bytes: int = 2 * 1024 * 1024):
+        self.sample_size = sample_size
+        self.stability_threshold = stability_threshold
+        self.observe_seconds = observe_seconds
+        self.split_on_trigger = split_on_trigger
+        self.benefit_ratio = benefit_ratio
+        self.max_workers = max_workers
+        self.min_split_bytes = min_split_bytes
+
+        self._speed_history: list[float] = []
+        self._enabled: bool = True
+        self._baseline_workers: int = 0
+        self._baseline_speed: float = 0.0
+        self._observe_started_at: float = 0.0
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    def feed(self, current_speed_bps: int, current_worker_count: int,
+             loop_time: Optional[float] = None) -> List[int]:
+        """喂入一次速度采样，返回本次应分裂的分片索引列表（可能为空）
+
+        Args:
+            current_speed_bps: 当前下载速度（bytes/s）
+            current_worker_count: 当前活跃 worker 数
+            loop_time: 事件循环时间戳（None=自动取）
+
+        Returns:
+            需要被分裂的最慢分片索引列表（由调用方执行实际分裂）
+        """
+        if not self._enabled:
+            return []
+
+        speed_mbps = (current_speed_bps * 8) / 1_000_000
+        self._speed_history.append(speed_mbps)
+        if len(self._speed_history) > self.sample_size:
+            self._speed_history.pop(0)
+        if len(self._speed_history) < self.sample_size:
+            return []
+
+        avg = sum(self._speed_history) / len(self._speed_history)
+        if avg <= 0:
+            return []
+        max_dev = max(abs(s - avg) / avg for s in self._speed_history)
+        # 速度不稳定（抖动大）→ 不加速，等稳定
+        if max_dev > self.stability_threshold:
+            return []
+
+        now = loop_time if loop_time is not None else time.time()
+
+        # 首次触发：建立基线并立即分裂若干最慢分片
+        if self._observe_started_at == 0.0:
+            if current_worker_count >= self.max_workers:
+                self._enabled = False
+                return []
+            self._baseline_workers = current_worker_count
+            self._baseline_speed = avg
+            self._observe_started_at = now
+            return self._pick_split_targets(current_worker_count,
+                                            self.split_on_trigger)
+
+        # 观察期未满
+        if now - self._observe_started_at < self.observe_seconds:
+            return []
+
+        # 观察期结束：对比增比
+        worker_ratio = self._safe_ratio(current_worker_count - self._baseline_workers,
+                                        self._baseline_workers)
+        speed_ratio = self._safe_ratio(avg - self._baseline_speed,
+                                       self._baseline_speed)
+
+        # 速度提升不显著（低于 worker 增比的 benefit_ratio 倍）→ 停止加速
+        if speed_ratio < worker_ratio * self.benefit_ratio:
+            self._enabled = False
+            log.info(f"自适应加速停止: worker增比={worker_ratio:.0%}, "
+                     f"速度增比={speed_ratio:.0%} (收益不足)")
+            return []
+
+        # 收益达标，重置观察期，继续尝试加速
+        self._observe_started_at = 0.0
+        log.debug(f"自适应加速继续: worker增比={worker_ratio:.0%}, "
+                  f"速度增比={speed_ratio:.0%}")
+        return []
+
+    def _pick_split_targets(self, current_workers: int,
+                            want: int) -> List[int]:
+        """由调用方填充候选分片后再选；此处返回占位空列表
+
+        实际选择最慢分片需要调用方提供分片状态（见 pick_slowest）。
+        本方法保留接口对称；HTTPDriver 直接调用 pick_slowest。
+        """
+        return []
+
+    @staticmethod
+    def _safe_ratio(delta: float, base: float) -> float:
+        if base <= 0:
+            return 0.0
+        return delta / base
+
+    @staticmethod
+    def split_range(start: int, end: int) -> Optional[Tuple[int, int]]:
+        """把 [start, end] 一分为二，返回新分片的 [start, end]
+
+        剩余不足 2 字节或低于 min_split 阈值时返回 None。
+        闭区间语义，与 HTTP Range 对齐。
+        """
+        remaining = end - start + 1
+        if remaining < 2:
+            return None
+        base = remaining // 2
+        remainder = remaining % 2
+        new_start = start + base + remainder
+        return (new_start, end)
+
+    def reset(self) -> None:
+        """重置状态（新下载任务复用控制器时调用）"""
+        self._speed_history.clear()
+        self._enabled = True
+        self._baseline_workers = 0
+        self._baseline_speed = 0.0
+        self._observe_started_at = 0.0

@@ -33,3 +33,6 @@ venv/
 
 # Project
 .codewhale/
+
+# Third-party reference repos (GPL code, never commit)
+.reference/
