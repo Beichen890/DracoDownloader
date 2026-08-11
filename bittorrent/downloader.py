@@ -16,7 +16,9 @@ import time
 from ..logger import get_logger
 from .magnet import MagnetParser, MagnetLink
 from .dht import DHTClient
-from .peer import Peer, PeerConnection, DEFAULT_BLOCK_SIZE, MSG_UNCHOKE
+from .peer import (
+    Peer, PeerConnection, DEFAULT_BLOCK_SIZE, MAX_PIPELINED_REQUESTS, MSG_UNCHOKE,
+)
 from .bencode import decode_torrent, info_hash as calc_info_hash
 
 log = get_logger('bittorrent.downloader')
@@ -134,6 +136,10 @@ class BTDownloader:
     DEFAULT_PIECE_LENGTH = 256 * 1024
     MAX_RETRIES_PER_PIECE = 3
     MAX_CONNECTIONS = 20
+    # endgame 阈值：剩余 piece 数 ≤ 此值时进入 endgame 模式，
+    # 对每个剩余 piece 向所有拥有它的 peer 同时发请求，先到先用，
+    # 完成后向其他 peer 发 cancel，显著加速收尾。
+    ENDGAME_THRESHOLD = 5
 
     def __init__(self, source: str, output_path: str,
                  progress_callback: Optional[Callable[[int, int, int], None]] = None,
@@ -516,7 +522,7 @@ class BTDownloader:
             for idx in range(self._piece_count):
                 if idx in self._completed_pieces:
                     continue
-                if idx in self._in_progress_pieces:
+                if idx in self._in_progress_pieces and not self._is_endgame():
                     continue
                 if idx not in self.pieces:
                     continue
@@ -524,12 +530,16 @@ class BTDownloader:
                     return idx
             return None
 
+        # endgame 模式：剩余 piece 少，允许对 in-progress 的 piece
+        # 同时发请求（多 peer 并发抢收尾），先到先用。
+        allow_in_progress = self._is_endgame()
+
         # 收集该 peer 可用的、未完成的 pieces
         candidates = []
         for idx in range(self._piece_count):
             if idx in self._completed_pieces:
                 continue
-            if idx in self._in_progress_pieces:
+            if idx in self._in_progress_pieces and not allow_in_progress:
                 continue
             if idx not in self.pieces:
                 continue
@@ -622,34 +632,47 @@ class BTDownloader:
                 self._total_size = max(self._total_size, (index + 1) * self._piece_length)
 
     async def _request_piece(self, conn: PeerConnection, piece: Piece):
-        """请求一个 piece 的所有块"""
+        """请求一个 piece 的所有块（流水线模式）
+
+        保持最多 MAX_PIPELINED_REQUESTS 个 in-flight 请求，
+        而非"发一个等一个"，提升单 peer 吞吐。
+        """
         remaining = piece.length
         offset = 0
         block_size = DEFAULT_BLOCK_SIZE
+        in_flight = 0
 
         while remaining > 0 and self._running and conn.is_connected:
             if conn.is_choking:
                 await asyncio.sleep(0.5)
                 continue
 
-            size = min(block_size, remaining)
-            key = (piece.index, offset)
-            if key not in self._requested_blocks:
-                self._requested_blocks.add(key)
-                try:
-                    await conn.send_request(piece.index, offset, size)
-                except (ConnectionError, OSError):
-                    break
+            # 填充 in-flight 队列到上限
+            while (in_flight < MAX_PIPELINED_REQUESTS
+                   and remaining > 0 and not conn.is_choking):
+                size = min(block_size, remaining)
+                key = (piece.index, offset)
+                if key not in self._requested_blocks:
+                    self._requested_blocks.add(key)
+                    try:
+                        await conn.send_request(piece.index, offset, size)
+                    except (ConnectionError, OSError):
+                        return
+                    in_flight += 1
+                offset += size
+                remaining -= size
 
-            offset += size
-            remaining -= size
+            if in_flight == 0:
+                continue
 
+            # 收一条响应（_on_piece_data 回调会写入块并减 in_flight 计数由下方）
             try:
                 msg = await conn._receive_message()
                 if msg is None:
-                    break
+                    return
             except Exception:
-                break
+                return
+            in_flight = max(0, in_flight - 1)
 
     def _on_piece_data(self, index: int, offset: int, data: bytes):
         """接收到 piece 数据回调"""
@@ -769,6 +792,18 @@ class BTDownloader:
         """停止下载"""
         self._running = False
         await self._cleanup()
+
+    def _is_endgame(self) -> bool:
+        """是否进入 endgame 模式
+
+        当剩余未完成 piece 数 ≤ ENDGAME_THRESHOLD 时进入。
+        endgame 模式下对每个剩余 piece 向所有拥有它的 peer 同时发请求，
+        先到先用，避免某个慢 peer 拖住整个收尾。
+        """
+        if self._piece_count == 0:
+            return False
+        remaining = self._piece_count - len(self._completed_pieces)
+        return 0 < remaining <= self.ENDGAME_THRESHOLD
 
     async def _seed_phase(self):
         """做种阶段 - 根据策略做种，完成后退出"""
