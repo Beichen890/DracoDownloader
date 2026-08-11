@@ -22,6 +22,7 @@ from .mirror_selector import (
 from .optimizer import DownloadOptimizer, OptimalParams
 from .http_client import HttpClient, AntiBotError
 from .sniffer import ResourceSniffer, SniffResult, is_direct_link, classify_url
+from .auth import BilibiliAuth
 from .errors import (
     DracoError, make_error, ERR_ANTI_BOT, ERR_SNIFF_FAILED,
     ERR_NO_DIRECT_URL, sniff_failed_error, no_direct_url_error,
@@ -69,7 +70,8 @@ class DracoDownloader:
                  rotate_ua: bool = True,
                  mobile_ua: bool = False,
                  optimizer: Optional[DownloadOptimizer] = None,
-                 mirror_selector: Optional[SmartMirrorDownloader] = None):
+                 mirror_selector: Optional[SmartMirrorDownloader] = None,
+                 bilibili_storage_path: Optional[str] = None):
         """
         Args:
             max_concurrent: 最大并发任务数
@@ -83,6 +85,8 @@ class DracoDownloader:
             mobile_ua: 使用移动端 UA 池
             optimizer: 自定义优化器
             mirror_selector: 自定义镜像选择器
+            bilibili_storage_path: Bilibili cookie 持久化路径，
+                默认 ~/.draco/auth/bilibili.json
         """
         self.scheduler = Scheduler(max_concurrent=max_concurrent)
         self.engine = DownloadEngine()
@@ -103,6 +107,13 @@ class DracoDownloader:
 
         # 资源探嗅器（共享 HttpClient，带反爬能力）
         self._sniffer = ResourceSniffer(http_client=self._http_client)
+
+        # Bilibili 登录态管理（共享 HttpClient，cookie 注入）
+        from pathlib import Path
+        bili_path = Path(bilibili_storage_path) if bilibili_storage_path else None
+        self._bilibili_auth = BilibiliAuth(
+            self._http_client, storage_path=bili_path
+        )
 
         # 镜像选择器
         self._mirror_selector = mirror_selector
@@ -128,6 +139,7 @@ class DracoDownloader:
     async def __aenter__(self):
         """async context manager 支持"""
         await self._http_client.start()
+        self._auto_load_bilibili_login()
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
@@ -136,6 +148,15 @@ class DracoDownloader:
     async def start(self):
         """显式启动（非 async with 场景）"""
         await self._http_client.start()
+        self._auto_load_bilibili_login()
+
+    def _auto_load_bilibili_login(self):
+        """启动时自动加载已保存的 Bilibili 登录态（不阻塞，失败静默）"""
+        try:
+            if self._bilibili_auth.load_and_inject():
+                log.info("已恢复 Bilibili 登录态")
+        except Exception as e:
+            log.debug(f"加载 Bilibili 登录态失败（忽略）: {e}")
 
     async def close(self):
         """显式关闭（释放持久 session）"""
@@ -207,6 +228,60 @@ class DracoDownloader:
         if self._http_client._session is None:
             await self._http_client.start()
         return await self._sniffer.sniff(url, headers=headers)
+
+    # ------------------------------------------------------------------
+    # Bilibili 登录态
+    # ------------------------------------------------------------------
+
+    async def login_bilibili(self,
+                             on_qrcode: Optional[Callable] = None,
+                             on_status: Optional[Callable] = None,
+                             timeout: float = 180.0) -> Dict[str, Any]:
+        """Bilibili 扫码登录
+
+        登录成功后 cookie 自动注入 HttpClient 并持久化到本地文件，
+        后续 Bilibili API 请求（探嗅/下载）会自动携带，可获取更高画质。
+
+        Args:
+            on_qrcode: 异步回调，参数为二维码 URL 字符串。
+                调用方需将其渲染成二维码展示给用户扫码（如终端打印/生成图片）。
+                为 None 时仅记录到日志。
+            on_status: 异步回调，参数为 (code, message)，用于展示扫码进度。
+                code: 86039=未扫码, 86090=已扫码待确认, 0=成功
+            timeout: 二维码有效期（秒），默认 180
+
+        Returns:
+            {"success": bool, "message": str,
+             "username": str (成功时), "cookies": dict (成功时)}
+
+        示例::
+
+            async with DracoDownloader() as d:
+                result = await d.login_bilibili(
+                    on_qrcode=lambda url: print("扫码:", url)
+                )
+        """
+        if self._http_client._session is None:
+            await self._http_client.start()
+        return await self._bilibili_auth.login_async(
+            on_qrcode=on_qrcode, on_status=on_status, timeout=timeout,
+        )
+
+    async def check_bilibili_login(self) -> Dict[str, Any]:
+        """检查 Bilibili 登录态是否有效
+
+        Returns:
+            {"is_logged_in": bool, "username": str, "uid": int,
+             "vip_status": int, "message": str}
+        """
+        if self._http_client._session is None:
+            await self._http_client.start()
+        return await self._bilibili_auth.check_login()
+
+    def logout_bilibili(self):
+        """退出 Bilibili 登录（删除持久化文件 + 清空 jar 中 bilibili cookie）"""
+        self._bilibili_auth.logout()
+        log.info("已退出 Bilibili 登录")
 
     async def _resolve_direct_url(self, url: str,
                                   headers: Optional[Dict[str, str]] = None

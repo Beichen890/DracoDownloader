@@ -290,6 +290,60 @@ class HttpClient:
         except Exception:
             pass
 
+    def set_cookies(self, host: str, cookies: Dict[str, str]):
+        """向 cookie jar 注入 cookie（用于登录态注入）
+
+        注入后，对该 host 及其子域的后续请求（含 fetch_text/fetch_bytes）
+        会自动带这些 cookie，与 clean_headers 无关（cookie 由 jar 层管理）。
+
+        cookie 的 domain 设为 .{host}，使子域也生效（如注入到 bilibili.com
+        后，api.bilibili.com / passport.bilibili.com 也能命中）。
+
+        Args:
+            host: 目标 host（如 "bilibili.com"）；可带 scheme，仅取 netloc
+            cookies: cookie dict，如 {"SESSDATA": "xxx", "bili_jct": "yyy"}
+        """
+        from http.cookies import SimpleCookie
+        from yarl import URL
+        if not cookies:
+            return
+        # 取 netloc
+        if "://" in host:
+            host = urlparse(host).netloc or host
+        host = host.lower()
+        url = URL(f"https://{host}/")
+        if self._cookie_jar is None:
+            self._cookie_jar = aiohttp.CookieJar(unsafe=True)
+        # 用 SimpleCookie 构造，显式设置 domain=.host，
+        # 让主域和所有子域（api./www./passport. 等）都命中
+        morsels = SimpleCookie()
+        for name, value in cookies.items():
+            morsels[name] = value
+            morsels[name]["domain"] = f".{host}" if "." in host else host
+        self._cookie_jar.update_cookies(morsels, url)
+        log.debug(f"HttpClient 注入 {len(cookies)} 个 cookie 到 {host}")
+
+    def get_cookies(self, host: str) -> Dict[str, str]:
+        """读取当前 jar 中对指定 host 生效的 cookie
+
+        Returns:
+            cookie dict（name→value），无则空 dict
+        """
+        from yarl import URL
+        if "://" in host:
+            host = urlparse(host).netloc or host
+        host = host.lower()
+        if self._cookie_jar is None:
+            return {}
+        url = URL(f"https://{host}/")
+        result: Dict[str, str] = {}
+        try:
+            for cookie in self._cookie_jar.filter_cookies(url).values():
+                result[cookie.key] = cookie.value
+        except Exception:
+            return {}
+        return result
+
     async def request(self, method: str, url: str,
                       headers: Optional[Dict[str, str]] = None,
                       params: Optional[Dict] = None,
