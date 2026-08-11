@@ -350,29 +350,35 @@ class HTTPDriver(ProtocolDriver):
             'lock': asyncio.Lock(),
             'session': None,
             'progress_path': str(progress_file),
+            'all_tasks': set(),  # 所有 worker task（含分裂产生的）
+            'done': False,       # 主流程是否已结束（阻止 monitor 继续分裂）
         }
 
         try:
             async with aiohttp.ClientSession(timeout=self.timeout) as session:
                 state['session'] = session
                 # 初始 worker：每个分片一个（跳过已完成的）
-                tasks = []
                 for i, r in enumerate(ranges):
                     if r[2] >= (r[1] - r[0] + 1):
                         reporter.update(i, r[1] - r[0] + 1)
                         continue
-                    tasks.append(asyncio.create_task(
+                    t = asyncio.create_task(
                         self._adaptive_worker(i, state, session)
-                    ))
+                    )
+                    state['all_tasks'].add(t)
+                    t.add_done_callback(state['all_tasks'].discard)
 
                 # 监控任务：定期喂速度采样给控制器，按需分裂最慢分片
                 monitor = asyncio.create_task(
                     self._adaptive_monitor(state, callback)
                 )
 
-                if tasks:
-                    await asyncio.gather(*tasks, return_exceptions=True)
+                # 等待所有 worker 完成（含分裂产生的）
+                while state['all_tasks']:
+                    await asyncio.gather(*state['all_tasks'],
+                                         return_exceptions=True)
 
+                state['done'] = True
                 monitor.cancel()
                 try:
                     await monitor
@@ -476,7 +482,7 @@ class HTTPDriver(ProtocolDriver):
             return
 
         last_save = 0.0
-        while True:
+        while not state.get('done', False):
             await asyncio.sleep(1.0)
             loop_time = asyncio.get_event_loop().time()
             speed = state['speed_tracker'].get_speed()
@@ -535,12 +541,14 @@ class HTTPDriver(ProtocolDriver):
 
             # 处理待启动的 worker
             spawns = state.pop('pending_spawns', []) if 'pending_spawns' in state else []
+            session = state.get('session')
             for new_idx in spawns:
-                session = state.get('session')
-                if session is not None:
-                    asyncio.create_task(
+                if session is not None and not state.get('done', False):
+                    t = asyncio.create_task(
                         self._adaptive_worker(new_idx, state, session)
                     )
+                    state['all_tasks'].add(t)
+                    t.add_done_callback(state['all_tasks'].discard)
 
             # 定期保存断点
             now = asyncio.get_event_loop().time()
