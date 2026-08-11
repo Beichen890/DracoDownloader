@@ -24,7 +24,8 @@
 | **自研协议** | 🧬 完全自主可控 | 📚 依赖第三方实现 |
 
 > **DracoDownloader**：多协议一键下载 + 自动镜像加速 + 智能分片并发，Agent 调用的最佳选择，省时省钱省心！
-> v1.3.2 重磅更新：**TaskStep 步骤化管线** + **集中化错误目录** + **BT 多源加载器/Web Tracker/做种策略** + **配置系统** + **关键缺陷修复**，Agent 可观测性大幅提升！
+> v1.4.0 重磅更新：**资源探嗅（网页 URL → 直链）** + **GitHub/Bilibili 站点专用规则** + **反反爬 HTTP 客户端** + **Bilibili 扫码登录态**，Agent 可直接下载网页里的资源！
+> v1.3.2：**TaskStep 步骤化管线** + **集中化错误目录** + **BT 多源加载器/Web Tracker/做种策略** + **配置系统** + **关键缺陷修复**，Agent 可观测性大幅提升！
 
 ---
 
@@ -43,6 +44,9 @@
 - **并发调度器**: 带队列、并发控制、超时管理、自动重试、取消广播
 - **🆕 动态优化引擎**: 自动探测网络条件，计算最优分片数、线程数和连接数（详见下方优化原理）
 - **🆕 智能镜像选择器**: 多维度评分（延迟/带宽/DNS），自动切换到最快镜像
+- **🆕 资源探嗅引擎**: 给定网页 URL（如 GitHub release 页、Bilibili 视频页）自动解析出可下载直链
+- **🆕 反反爬 HTTP 客户端**: 持久 session + UA 轮换 + cookie 复用 + 智能重试 + 反爬错误分类
+- **🆕 站点登录态**: Bilibili 扫码登录 + cookie 持久化，登录后可下载高画质视频
 - **稀缺分片优先**: BT 下载采用稀有优先算法，提升 swarm 效率
 - **配置化 DHT**: 引导节点可通过环境变量 `DRACO_DHT_BOOTSTRAP_NODES` 配置
 - **进度持久化**: 支持断点续传进度文件 (.progress)
@@ -161,6 +165,61 @@ async def main():
 asyncio.run(main())
 ```
 
+### 🆕 资源探嗅：网页 URL → 直链
+
+给定页面 URL（非直链），自动探嗅出可下载资源。支持 GitHub release/blob 页、Bilibili 视频页等强反爬站点。
+
+```python
+import asyncio
+from DracoDownloader import DracoDownloader
+
+async def main():
+    async with DracoDownloader() as d:
+        # 探嗅 GitHub release 页 → 返回 assets 直链 + 加速站候选
+        result = await d.sniff("https://github.com/BurntSushi/ripgrep/releases/tag/14.1.1")
+        print(f"命中 {len(result.direct_urls)} 个资源")
+        best = result.best  # 置信度最高的直链
+        print(f"最优: {best.label} -> {best.url}")
+
+        # 直接下载页面里的资源（非直链会自动探嗅）
+        await d.download_async(
+            url="https://github.com/BurntSushi/ripgrep/releases/tag/14.1.1",
+            output_path="./ripgrep.tar.gz",
+        )
+
+asyncio.run(main())
+```
+
+### 🆕 Bilibili 扫码登录
+
+未登录只能下载 480P；扫码登录后 cookie 自动持久化，后续可下载 1080P+ 高画质视频。
+
+```python
+import asyncio
+from DracoDownloader import DracoDownloader
+
+async def main():
+    async with DracoDownloader() as d:
+        # 扫码登录（on_qrcode 回调拿到二维码 URL，自行渲染展示）
+        result = await d.login_bilibili(
+            on_qrcode=lambda url: print("用手机 B 站 App 扫码:", url)
+        )
+        if result["success"]:
+            print(f"登录成功: {result['username']}")
+
+        # 登录后探嗅 → 高画质直链
+        r = await d.sniff("https://www.bilibili.com/video/BV1GJ411x7h7")
+        print(r.best.label, r.best.url)
+
+        # 检查登录态 / 退出登录
+        # status = await d.check_bilibili_login()
+        # d.logout_bilibili()
+
+asyncio.run(main())
+```
+
+> cookie 默认持久化到 `~/.draco/auth/bilibili.json`，下次启动自动加载，无需重复登录。
+
 ---
 
 ## 项目结构
@@ -174,8 +233,12 @@ DracoDownloader/
 ├── progress.py              # 进度持久化管理
 ├── logger.py                # 日志系统
 ├── cli.py                   # 命令行工具
-├── mirror_selector.py       # 🆕 镜像选择器（自动选最快镜像站）
-├── optimizer.py             # 🆕 下载优化器（动态分片/线程数计算）
+├── mirror_selector.py       # 镜像选择器（自动选最快镜像站）
+├── optimizer.py             # 下载优化器（动态分片/线程数计算）
+├── http_client.py           # 🆕 反反爬 HTTP 客户端（UA 轮换/cookie/重试/反爬分类）
+├── sniffer.py               # 🆕 资源探嗅引擎（页面 URL → 直链）
+├── sites.py                 # 🆕 站点专用规则（GitHub/Bilibili API 解析）
+├── auth.py                  # 🆕 站点登录态（Bilibili 扫码登录 + cookie 持久化）
 ├── requirements.txt         # 依赖声明
 │
 ├── protocols/               # 协议驱动
@@ -313,6 +376,14 @@ DracoDownloader 是 DracoHub 项目的一部分，专为 Agent 原生下载场�
 - 🍴 **Fork** — 参与改进
 - 🐛 **提 Issue** — 反馈问题
 - 💬 **分享** — 推荐给需要的朋友
+
+v1.4.0 新增特性：
+- 🔍 **资源探嗅引擎** — 给定网页 URL（GitHub release/Bilibili 视频页等）自动解析出可下载直链
+- 🌐 **站点专用规则** — GitHub（release/blob/archive + 加速站候选）、Bilibili（WBI 签名 + DASH 流 + 分P）
+- 🛡️ **反反爬 HTTP 客户端** — 持久 session + UA 轮换 + cookie 复用 + 智能重试 + 反爬错误分类（AntiBotError）
+- 🔐 **Bilibili 扫码登录** — passport API 扫码 + cookie 持久化，登录后可下载 1080P+ 高画质
+- 🚀 **站点规则优先执行** — 直接调站点 API 绕过强反爬页面（如 B 站 412）
+- 🧹 **clean_headers 模式** — 调 REST API 时剥离浏览器伪装头，避免触发 403/412
 
 v1.3.2 新增特性与修复：
 - 🦮 **自动最优镜像站选择** — 内置 12+ 镜像节点，自动选最快的

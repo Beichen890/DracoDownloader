@@ -1,5 +1,24 @@
 # Changelog
 
+## [1.4.0] - 2026-08-11
+
+### Added
+- **资源探嗅引擎**: 给定网页 URL 自动解析出可下载直链（`sniffer.py`），支持插拔式 `SniffRule` 框架
+- **站点专用规则**: GitHub（release/blob/archive + 加速站候选）、Bilibili（WBI 签名 + DASH 流 + 分P）
+- **反反爬 HTTP 客户端**: `http_client.py` 持久 session + UA 轮换 + cookie 复用 + 智能重试 + `AntiBotError` 分类
+- **clean_headers 模式**: 调 REST API 时剥离浏览器伪装头，避免触发 403/412
+- **Bilibili 扫码登录**: `auth.py` passport API 扫码 + cookie 持久化，登录后可下载 1080P+ 高画质
+- **站点规则优先执行**: 直接调站点 API 绕过强反爬页面拉取
+- **cookie 注入/读取**: `HttpClient.set_cookies()` / `get_cookies()`，domain 作用域到子域
+- **DracoDownloader 登录态 API**: `login_bilibili()` / `check_bilibili_login()` / `logout_bilibili()`，启动自动加载已保存 cookie
+- **测试**: `tests/test_sites.py`、`tests/test_sniffer_http.py`、`tests/test_direct_url_resolution.py`、`tests/test_auth.py`
+- **端到端实测脚本**: `.e2e/run_sites_e2e.py`（GitHub/Bilibili 探嗅 + 可选扫码登录）
+
+### Changed
+- `protocols/http.py`、`protocols/m3u8.py` 接入共享 HttpClient（UA/cookie/proxy/Referer 复用）
+- `core.py` 集成探嗅器 + HttpClient + BilibiliAuth，新增 `bilibili_storage_path` 参数
+- `errors.py` 新增 `AntiBotError` 反爬错误类
+
 ## [1.3.2] - 2026-07-23
 
 ### Fixed
