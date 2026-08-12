@@ -17,18 +17,38 @@ from .base import ProtocolDriver, DownloadHandle
 from ..optimizer import (
     DownloadOptimizer, OptimalParams, NetworkProfile, AdaptiveSpeedupController,
 )
+from ..logger import get_logger
+
+log = get_logger('http')
 
 # === 常量定义 ===
 _DEFAULT_MAX_CONNECTIONS = 64
 _DEFAULT_CHUNK_SIZE = 1024 * 1024        # 1 MiB
 _HTTP_TIMEOUT_TOTAL = 300                 # 5 min
 _HTTP_TIMEOUT_CONNECT = 30                # 30 s
+_HTTP_TIMEOUT_SOCK_READ = 15              # 15s 单次读取间隔超时（防完全卡死）
 _MERGE_BUFFER_SIZE = 16 * 1024 * 1024     # 16 MiB 合并缓冲区
 _CHUNK_RETRIES = 5                        # 分片下载最大重试次数
 _CHUNK_RETRY_BACKOFF = 2                  # 重试退避指数基数
 _SINGLE_FILE_THRESHOLD_FACTOR = 2         # 单线程阈值 = chunk_size * 2
 _PROGRESS_EMIT_INTERVAL = 0.05            # 进度回调最小间隔（秒）
 _SPEED_WINDOW_SECONDS = 2.0               # 速度计算滑动窗口（秒）
+
+# === 慢速 trickle 检测（速率守卫） ===
+# sock_read 只能抓"完全无数据 N 秒"，抓不到"持续发送少量数据"的 trickle。
+# 真实场景：CDN 某条路由变慢，服务器以 9 KB/s 持续吐字节，sock_read 永不触发，
+# 但实际下载要卡 250s+。这里在应用层加滑动窗口速率检测。
+_SLOW_SHARD_WINDOW_S = 10.0               # 速率检测窗口（秒）
+_SLOW_SHARD_MIN_BPS = 200_000             # 最低可接受速度 200 Kbps ≈ 25 KB/s
+_SLOW_SHARD_GRACE_S = 5.0                 # 启动 grace 期（TCP slow start、首包延迟）
+
+# 分片下载专用 timeout：sock_read 防止服务器 hold 连接 trickle 数据
+# 导致长尾分片卡满 total timeout（如 19 分片 18 个秒完、最后 1 个卡 300s）
+_CHUNK_TIMEOUT = aiohttp.ClientTimeout(
+    total=_HTTP_TIMEOUT_TOTAL,
+    connect=_HTTP_TIMEOUT_CONNECT,
+    sock_read=_HTTP_TIMEOUT_SOCK_READ,
+)
 
 
 class _SpeedTracker:
@@ -394,6 +414,7 @@ class HTTPDriver(ProtocolDriver):
             'reporter': reporter,
             'speed_tracker': speed_tracker,
             'active_workers': 0,
+            'active_ranges': set(),  # 有 worker 在跑的分片 idx（检测孤儿）
             'lock': asyncio.Lock(),
             'session': None,
             'progress_path': str(progress_file),
@@ -411,6 +432,7 @@ class HTTPDriver(ProtocolDriver):
                     if r[2] >= (r[1] - r[0] + 1):
                         reporter.update(i, r[1] - r[0] + 1)
                         continue
+                    state['active_ranges'].add(i)
                     t = asyncio.create_task(
                         self._adaptive_worker(i, state, session)
                     )
@@ -477,6 +499,8 @@ class HTTPDriver(ProtocolDriver):
             async with state['lock']:
                 state['active_workers'] += 1
 
+            consecutive_stalls = 0
+            _MAX_STALL_RETRIES = 5
             try:
                 while True:
                     async with state['lock']:
@@ -490,7 +514,8 @@ class HTTPDriver(ProtocolDriver):
 
                     headers = {'Range': f'bytes={http_start}-{http_end}'}
                     try:
-                        async with session.get(url, headers=headers) as resp:
+                        async with session.get(url, headers=headers,
+                                               timeout=_CHUNK_TIMEOUT) as resp:
                             if resp.status not in (200, 206):
                                 if resp.status == 416:
                                     async with state['lock']:
@@ -499,7 +524,9 @@ class HTTPDriver(ProtocolDriver):
                                     return
                                 raise RuntimeError(f"HTTP {resp.status}")
                             offset = http_start
-                            async for data in resp.content.iter_chunked(chunk_size):
+                            async for data in self._iter_with_rate_guard(
+                                resp.content, chunk_size, idx
+                            ):
                                 if not data:
                                     continue
                                 # 定位写：直接写最终文件偏移，零合并
@@ -511,13 +538,28 @@ class HTTPDriver(ProtocolDriver):
                                     state['speed_tracker'].add(
                                         sum(rr[2] for rr in ranges)
                                     )
-                    except (ConnectionError, OSError, asyncio.TimeoutError) as e:
+                            # 本次请求成功完成，重置 stall 计数
+                            consecutive_stalls = 0
+                    except asyncio.TimeoutError as e:
+                        # sock_read 超时或速率守卫触发：trickle/卡死
+                        consecutive_stalls += 1
+                        log.debug(f"分片 {idx} 超时（sock_read/速率守卫），"
+                                  f"第 {consecutive_stalls}/{_MAX_STALL_RETRIES} 次: {e}")
+                        if consecutive_stalls >= _MAX_STALL_RETRIES:
+                            # 持续 stall：剩余区间交给 monitor 分裂接管，本 worker 退出
+                            log.warning(f"分片 {idx} 连续 {_MAX_STALL_RETRIES} 次 "
+                                        f"读取超时，放弃由分裂接管")
+                            return
+                        await asyncio.sleep(1)
+                        continue
+                    except (ConnectionError, OSError) as e:
                         log.debug(f"分片 {idx} 错误，重试: {e}")
                         await asyncio.sleep(1)
                         continue
             finally:
                 async with state['lock']:
                     state['active_workers'] -= 1
+                    state['active_ranges'].discard(idx)
 
     async def _adaptive_monitor(self, state: dict,
                                 callback: Optional[Callable[[int, int, int], None]]) -> None:
@@ -541,6 +583,13 @@ class HTTPDriver(ProtocolDriver):
 
             async with state['lock']:
                 active = state['active_workers']
+                active_ranges = set(state['active_ranges'])
+                # 检测孤儿分片：有剩余字节但无 worker 在跑（stall 退出后遗留）
+                orphans = []
+                for i, r in enumerate(ranges):
+                    remaining = r[1] - r[0] + 1 - r[2]
+                    if remaining > 0 and i not in active_ranges:
+                        orphans.append(i)
                 # 选剩余字节最多的分片作为分裂候选
                 candidates = []
                 for i, r in enumerate(ranges):
@@ -548,6 +597,21 @@ class HTTPDriver(ProtocolDriver):
                     if remaining > controller.min_split_bytes:
                         candidates.append((remaining, i))
                 candidates.sort(reverse=True)
+
+            # 接管孤儿分片：stall worker 退出后遗留的未完成区间
+            session = state.get('session')
+            for orphan_idx in orphans:
+                if session is not None and not state.get('done', False):
+                    async with state['lock']:
+                        if orphan_idx in state['active_ranges']:
+                            continue  # 已被其他循环接管
+                        state['active_ranges'].add(orphan_idx)
+                    log.debug(f"接管孤儿分片 {orphan_idx}")
+                    t = asyncio.create_task(
+                        self._adaptive_worker(orphan_idx, state, session)
+                    )
+                    state['all_tasks'].add(t)
+                    t.add_done_callback(state['all_tasks'].discard)
 
             split_count = 0
             # 首次触发时 controller 通过 feed 返回（当前实现返回空列表，
@@ -596,6 +660,7 @@ class HTTPDriver(ProtocolDriver):
             session = state.get('session')
             for new_idx in spawns:
                 if session is not None and not state.get('done', False):
+                    state['active_ranges'].add(new_idx)
                     t = asyncio.create_task(
                         self._adaptive_worker(new_idx, state, session)
                     )
@@ -644,6 +709,67 @@ class HTTPDriver(ProtocolDriver):
         except Exception:
             pass
 
+    async def _iter_with_rate_guard(
+        self,
+        content: aiohttp.StreamReader,
+        chunk_size: int,
+        shard_idx: int,
+    ):
+        """带速率守卫的响应内容迭代器
+
+        sock_read 只能抓"完全无数据 N 秒"，抓不到 trickle：
+        服务器持续发送少量数据（如 9 KB/s），每次 read 都在 sock_read 内返回，
+        但整体速度极低，导致长尾分片卡 250s+。
+
+        本方法在应用层加滑动窗口速率检测：
+        - 启动 grace 期 _SLOW_SHARD_GRACE_S 秒内不检查（TCP slow start）
+        - 之后每 _SLOW_SHARD_WINDOW_S 秒检查窗口内接收字节数
+        - 低于 _SLOW_SHARD_MIN_BPS 对应字节数 → 抛 asyncio.TimeoutError
+        - 单次 read 也用 asyncio.wait_for 限制，双重保险
+
+        TimeoutError 由调用方捕获并触发重连/分裂。
+        """
+        now_start = time.time()
+        grace_until = now_start + _SLOW_SHARD_GRACE_S
+        window_start = now_start
+        bytes_in_window = 0
+        in_grace = True
+        iterator = content.iter_chunked(chunk_size)
+        while True:
+            try:
+                data = await asyncio.wait_for(
+                    iterator.__anext__(),
+                    timeout=_SLOW_SHARD_WINDOW_S,
+                )
+            except StopAsyncIteration:
+                break
+            now = time.time()
+            if in_grace:
+                # grace 期内不检查（TCP slow start、首包延迟等正常慢启动）
+                if now >= grace_until:
+                    # grace 结束，重置窗口起点，丢弃 grace 期累积
+                    in_grace = False
+                    window_start = now
+                    bytes_in_window = 0
+                bytes_in_window += len(data)
+                yield data
+                continue
+            bytes_in_window += len(data)
+            elapsed = now - window_start
+            if elapsed >= _SLOW_SHARD_WINDOW_S:
+                min_bytes = (_SLOW_SHARD_MIN_BPS / 8) * elapsed
+                if bytes_in_window < min_bytes:
+                    actual_bps = (bytes_in_window * 8 / elapsed) if elapsed > 0 else 0
+                    raise asyncio.TimeoutError(
+                        f"分片 {shard_idx} 速率过低: "
+                        f"{actual_bps:.0f} bps < 阈值 {_SLOW_SHARD_MIN_BPS} bps "
+                        f"(window={elapsed:.1f}s, bytes={bytes_in_window})"
+                    )
+                # 窗口重置
+                window_start = now
+                bytes_in_window = 0
+            yield data
+
     async def _download_chunk(self, url: str, start: int, end: int,
                               temp_dir: Path, idx: int,
                               semaphore: asyncio.Semaphore,
@@ -669,7 +795,8 @@ class HTTPDriver(ProtocolDriver):
                     headers = self._merge_headers(
                         {'Range': f'bytes={start}-{end}'}, handle_headers
                     )
-                    async with session.get(url, headers=headers, proxy=proxy) as resp:
+                    async with session.get(url, headers=headers, proxy=proxy,
+                                           timeout=_CHUNK_TIMEOUT) as resp:
                         if resp.status not in (200, 206):
                             if resp.status == 416:
                                 # Range not satisfiable → 已完整下载
@@ -677,11 +804,19 @@ class HTTPDriver(ProtocolDriver):
                             raise RuntimeError(f"HTTP {resp.status}")
 
                         with open(chunk_file, 'wb') as f:
-                            async for data in resp.content.iter_chunked(self.chunk_size):
+                            async for data in self._iter_with_rate_guard(
+                                resp.content, self.chunk_size, idx
+                            ):
                                 f.write(data)
                                 downloaded += len(data)
                                 reporter.update(idx, downloaded)
                 return
+            except asyncio.TimeoutError as e:
+                # sock_read 超时或速率守卫触发：断开重连
+                log.debug(f"分片 {idx} 超时（sock_read/速率守卫），重试: {e}")
+                if attempt == _CHUNK_RETRIES - 1:
+                    raise
+                await asyncio.sleep(_CHUNK_RETRY_BACKOFF ** attempt)
             except Exception as e:
                 if attempt == _CHUNK_RETRIES - 1:
                     raise

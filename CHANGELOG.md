@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.4.1] - 2026-08-12
+
+### Fixed
+- **长尾分片卡死（核心修复）**: 解决多分片下载时单个分片拖慢整体速度的问题
+  - `sock_read` 超时: 分片请求加 15s 单次读取间隔超时，防止服务器完全 hold 连接
+  - **慢速 trickle 检测（速率守卫）**: sock_read 抓不到"持续发送少量数据"的 trickle 场景（如 CDN 路由变慢后以 9 KB/s 吐字节），新增应用层滑动窗口速率检测，grace 5s + 窗口 10s，速度低于 200 Kbps 抛 `TimeoutError` 触发重连
+  - 孤儿分片接管: worker 连续超时退出后，监控器检测无活跃 worker 的分片并重新 spawn
+  - 自适应控制器速度归零时触发紧急分裂（`AdaptiveSpeedupController.feed`）
+
+### Added
+- `tests/test_http_stall.py`: 完全 stall + 慢速 trickle 两类场景的 4 个测试用例（合并路径 + 自适应路径各 2 个）
+
 ## [1.4.0] - 2026-08-11
 
 ### Added
