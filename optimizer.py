@@ -595,6 +595,10 @@ class AdaptiveSpeedupController:
 
         avg = sum(self._speed_history) / len(self._speed_history)
         if avg <= 0:
+            # 速度归零：长尾分片卡住，正是最需要分裂接管的时候
+            # 跳过稳定性检查（avg=0 时 max_dev 会除零），触发紧急分裂
+            if current_worker_count < self.max_workers:
+                return [0]  # 占位标记，monitor 按数量分裂最慢分片
             return []
         max_dev = max(abs(s - avg) / avg for s in self._speed_history)
         # 速度不稳定（抖动大）→ 不加速，等稳定
