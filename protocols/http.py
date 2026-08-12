@@ -420,6 +420,7 @@ class HTTPDriver(ProtocolDriver):
             'progress_path': str(progress_file),
             'all_tasks': set(),  # 所有 worker task（含分裂产生的）
             'done': False,       # 主流程是否已结束（阻止 monitor 继续分裂）
+            'split_event': asyncio.Event(),  # worker 完成/退出信号（事件驱动分裂）
         }
 
         try:
@@ -560,24 +561,73 @@ class HTTPDriver(ProtocolDriver):
                 async with state['lock']:
                     state['active_workers'] -= 1
                     state['active_ranges'].discard(idx)
+                # 事件驱动：通知 monitor 立即检查分裂/孤儿接管
+                # （worker 完成或 stall 退出都会走这里，monitor 响应延迟从 ~1s 降到 ~0）
+                state['split_event'].set()
+
+    def _spawn_split_worker(self, state: dict, idx: int) -> bool:
+        """分裂指定分片并启动新 worker（同步方法，内部无 await）
+
+        把 ranges[idx] 的未下载尾部一分为二，缩小原分片 end，
+        新增一个分片并启动 worker 接管后半段。
+
+        Returns:
+            True 如果分裂并启动了新 worker；False 如果不可分裂（剩余太小等）
+        """
+        ranges = state['ranges']
+        r = ranges[idx]
+        start, end, downloaded = r[0], r[1], r[2]
+        split_at = AdaptiveSpeedupController.split_range(
+            start + downloaded, end
+        )
+        if split_at is None:
+            return False
+        new_start, new_end = split_at
+        ranges[idx][1] = new_start - 1
+        new_idx = len(ranges)
+        ranges.append([new_start, new_end, 0])
+        log.debug(f"分裂分片 {idx} → 新分片 {new_idx} "
+                  f"[{new_start},{new_end}]")
+        session = state.get('session')
+        if session is None or state.get('done', False):
+            return False
+        state['active_ranges'].add(new_idx)
+        t = asyncio.create_task(
+            self._adaptive_worker(new_idx, state, session)
+        )
+        state['all_tasks'].add(t)
+        t.add_done_callback(state['all_tasks'].discard)
+        return True
 
     async def _adaptive_monitor(self, state: dict,
                                 callback: Optional[Callable[[int, int, int], None]]) -> None:
-        """监控任务：定期采样速度，速度稳定时分裂最慢分片
+        """监控任务：事件驱动分裂 + 定时速度采样
 
-        每 1 秒喂一次速度采样给 AdaptiveSpeedupController。
-        当控制器要求分裂时，选剩余字节最多的分片，把它的 [start, end]
-        一分为二，缩小原分片 end，新增一个 worker 接管后半段。
+        响应模式（二选一触发）：
+        1. 事件驱动：worker 完成/退出时 set split_event，monitor 立即醒
+           → 检查孤儿接管 + 尝试分裂最慢分片（响应延迟 ~0 vs 原 ~1s）
+        2. 定时兜底：1s 超时无事件 → 速度采样喂 controller + 分裂判定
+
+        速度采样按 1s 节奏喂 AdaptiveSpeedupController（避免事件频繁触发采样失真）。
+        事件触发的分裂受 controller.enabled 控制，不绕过收益判定。
         """
         ranges = state['ranges']
-        reporter = state['reporter']
         controller = self._adaptive_controller
         if controller is None:
             return
 
+        split_event = state['split_event']
         last_save = 0.0
+        last_feed = 0.0
+
         while not state.get('done', False):
-            await asyncio.sleep(1.0)
+            # 等待事件或 1s 超时（事件驱动优先，定时兜底）
+            try:
+                await asyncio.wait_for(split_event.wait(), timeout=1.0)
+            except asyncio.TimeoutError:
+                pass
+            split_event.clear()
+
             loop_time = asyncio.get_event_loop().time()
             speed = state['speed_tracker'].get_speed()
 
@@ -585,17 +635,12 @@ class HTTPDriver(ProtocolDriver):
                 active = state['active_workers']
                 active_ranges = set(state['active_ranges'])
                 # 检测孤儿分片：有剩余字节但无 worker 在跑（stall 退出后遗留）
-                orphans = []
-                for i, r in enumerate(ranges):
-                    remaining = r[1] - r[0] + 1 - r[2]
-                    if remaining > 0 and i not in active_ranges:
-                        orphans.append(i)
+                orphans = [i for i, r in enumerate(ranges)
+                           if r[1] - r[0] + 1 - r[2] > 0 and i not in active_ranges]
                 # 选剩余字节最多的分片作为分裂候选
-                candidates = []
-                for i, r in enumerate(ranges):
-                    remaining = r[1] - r[0] + 1 - r[2]
-                    if remaining > controller.min_split_bytes:
-                        candidates.append((remaining, i))
+                candidates = [(r[1] - r[0] + 1 - r[2], i)
+                              for i, r in enumerate(ranges)
+                              if r[1] - r[0] + 1 - r[2] > controller.min_split_bytes]
                 candidates.sort(reverse=True)
 
             # 接管孤儿分片：stall worker 退出后遗留的未完成区间
@@ -613,68 +658,45 @@ class HTTPDriver(ProtocolDriver):
                     state['all_tasks'].add(t)
                     t.add_done_callback(state['all_tasks'].discard)
 
-            split_count = 0
-            # 首次触发时 controller 通过 feed 返回（当前实现返回空列表，
-            # 由本方法直接选候选）；这里统一用候选数限制
-            should_split = controller.feed(speed, active, loop_time)
-            # controller.feed 首次触发后 _observe_started_at != 0，
-            # 我们在首次触发时主动分裂 split_on_trigger 个
-            if (controller._observe_started_at != 0
-                    and controller._baseline_workers == active
-                    and not getattr(controller, '_initial_split_done', False)):
-                split_count = min(controller.split_on_trigger,
-                                  len(candidates),
-                                  controller.max_workers - active)
-                controller._initial_split_done = True
-            elif should_split:
-                split_count = len(should_split)
+            # 速度采样按 1s 节奏喂 controller（避免事件频繁触发采样失真）
+            should_feed = loop_time - last_feed >= 1.0
+            if should_feed:
+                last_feed = loop_time
+                should_split = controller.feed(speed, active, loop_time)
+                # 首次触发：建立基线并分裂 split_on_trigger 个
+                if (controller._observe_started_at != 0
+                        and controller._baseline_workers == active
+                        and not getattr(controller, '_initial_split_done', False)):
+                    split_count = min(controller.split_on_trigger,
+                                      len(candidates),
+                                      controller.max_workers - active)
+                    controller._initial_split_done = True
+                elif should_split:
+                    split_count = len(should_split)
+                else:
+                    split_count = 0
+            else:
+                # 事件触发（非采样节奏）：事件驱动分裂 1 个最慢分片
+                # 受 controller.enabled 控制，收益不达标时 controller 会 disabled
+                if controller.enabled and active < controller.max_workers:
+                    split_count = min(1, len(candidates),
+                                      controller.max_workers - active)
+                else:
+                    split_count = 0
 
             for _ in range(split_count):
                 if not candidates:
                     break
                 _, idx = candidates.pop(0)
-                async with state['lock']:
-                    r = ranges[idx]
-                    start, end, downloaded = r[0], r[1], r[2]
-                    # 只分裂未下载部分的尾部
-                    split_at = AdaptiveSpeedupController.split_range(
-                        start + downloaded, end
-                    )
-                    if split_at is None:
-                        continue
-                    new_start, new_end = split_at
-                    # 缩小原分片 end 到分裂点前
-                    ranges[idx][1] = new_start - 1
-                    # 新增分片
-                    new_idx = len(ranges)
-                    ranges.append([new_start, new_end, 0])
-                    log.debug(f"分裂分片 {idx} → 新分片 {new_idx} "
-                              f"[{new_start},{new_end}]")
-                # 启动新 worker（需重新获取 session）
-                # 这里复用 state 中没有 session，简化为创建新任务由调用方 session 池
-                # 实际通过外部 session 引用启动
-                state.setdefault('pending_spawns', []).append(new_idx)
-
-            # 处理待启动的 worker
-            spawns = state.pop('pending_spawns', []) if 'pending_spawns' in state else []
-            session = state.get('session')
-            for new_idx in spawns:
-                if session is not None and not state.get('done', False):
-                    state['active_ranges'].add(new_idx)
-                    t = asyncio.create_task(
-                        self._adaptive_worker(new_idx, state, session)
-                    )
-                    state['all_tasks'].add(t)
-                    t.add_done_callback(state['all_tasks'].discard)
+                self._spawn_split_worker(state, idx)
 
             # 定期保存断点
-            now = asyncio.get_event_loop().time()
-            if now - last_save > 2.0:
+            if loop_time - last_save > 2.0:
                 async with state['lock']:
                     self._save_adaptive_progress(
                         Path(state['progress_path']), ranges
                     )
-                last_save = now
+                last_save = loop_time
 
     def _load_adaptive_progress(self, path: Path, count: int) -> list[int]:
         """加载自适应断点（每分片已写字节数）"""
