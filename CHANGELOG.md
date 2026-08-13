@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.4.2] - 2026-08-12
+
+### Fixed
+- **直链识别补充 .bin/.dat/.dump 后缀**: `sniffer.py` 的 `_DIRECT_LINK_EXTENSIONS` 新增通用二进制后缀，修复 `https://speed.hetzner.de/100MB.bin` 等测速文件被误判为非直链的问题
+- **探嗅失败回退直接下载**: `core.py` 的 `_resolve_direct_url` 在探嗅无结果/探嗅异常（非反爬）时回退为直接下载，不再直接失败。避免无约定后缀的直链因探嗅失败而整体下载失败（AntiBotError 仍抛出）
+- **CLI 资源泄漏**: `cli.py` 的 `main_async` 改用 `async with DracoDownloader(...)`，确保 HttpClient 的 aiohttp session 正确关闭，修复 "Unclosed client session" 警告
+- **CLI --timeout 参数生效**: `download_async` 调用时传入 `timeout=args.timeout`，用户设置的超时不再被忽略
+
+### Added
+- `tests/test_sniffer_http.py`: `test_generic_binary_extensions` 验证 .bin/.dat/.dump/.flash 后缀识别
+- `tests/test_direct_url_resolution.py`: 3 个回退测试（探嗅无结果/异常/best None → 回退直接下载）
+
 ## [1.4.1] - 2026-08-12
 
 ### Fixed

@@ -46,7 +46,7 @@ from .optimizer import (
     NetworkProfile, OptimalParams,
 )
 
-__version__ = "1.4.1"
+__version__ = "1.4.2"
 __all__ = [
     "DracoDownloader",
     "DownloadResult",

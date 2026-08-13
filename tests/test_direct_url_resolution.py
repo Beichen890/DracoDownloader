@@ -124,32 +124,38 @@ class TestResolveDirectUrl:
             assert exc_info.value.retryable is True
             assert "403" in exc_info.value.message
 
-    async def test_no_direct_url_raises(self):
-        """探嗅无结果 → no_direct_url_error"""
+    async def test_no_direct_url_falls_back_to_direct(self):
+        """探嗅无结果 → 回退为直接下载（不再抛 no_direct_url_error）
+
+        避免 .bin 等无约定后缀的直链因探嗅无结果而整体失败。
+        """
         async with DracoDownloader() as d:
             empty_result = SniffResult(original_url="https://www.example.com/empty")
             with patch.object(d, 'sniff', new=AsyncMock(return_value=empty_result)):
-                with pytest.raises(DracoError) as exc_info:
-                    await d._resolve_direct_url("https://www.example.com/empty")
-            assert exc_info.value.code == ERR_NO_DIRECT_URL
-            assert "https://www.example.com/empty" in exc_info.value.message
+                url, sniff_info = await d._resolve_direct_url(
+                    "https://www.example.com/empty"
+                )
+            assert url == "https://www.example.com/empty"
+            assert sniff_info is None  # 未探嗅命中，无 sniff_info
 
-    async def test_sniff_exception_wrapped(self):
-        """探嗅阶段其他异常 → sniff_failed_error"""
+    async def test_sniff_exception_falls_back_to_direct(self):
+        """探嗅阶段其他异常（非反爬）→ 回退为直接下载
+
+        网络抖动/临时错误不应让整个下载失败。
+        AntiBotError 仍抛出（见 test_antibot_raises_anti_bot_error）。
+        """
         async with DracoDownloader() as d:
             with patch.object(d, 'sniff', new=AsyncMock(
                 side_effect=RuntimeError("network down")
             )):
-                with pytest.raises(DracoError) as exc_info:
-                    await d._resolve_direct_url("https://www.example.com/x")
-            assert exc_info.value.code == ERR_SNIFF_FAILED
-            assert "network down" in exc_info.value.message
+                url, sniff_info = await d._resolve_direct_url(
+                    "https://www.example.com/x"
+                )
+            assert url == "https://www.example.com/x"
+            assert sniff_info is None
 
-    async def test_sniff_info_best_none_raises(self):
-        """best 为 None（direct_urls 非空但 best 计算 None）→ no_direct_url_error
-
-        边界：best 在 direct_urls 非空时一般不为 None，但防御性测试覆盖。
-        """
+    async def test_sniff_info_best_none_falls_back(self):
+        """best 为 None（边界）→ 回退为直接下载"""
         async with DracoDownloader() as d:
             sniff_result = SniffResult(original_url="https://www.example.com/x")
             sniff_result.direct_urls = [
@@ -160,9 +166,11 @@ class TestResolveDirectUrl:
             ]
             with patch.object(d, 'sniff', new=AsyncMock(return_value=sniff_result)):
                 with patch.object(SniffResult, 'best', new=None):
-                    with pytest.raises(DracoError) as exc_info:
-                        await d._resolve_direct_url("https://www.example.com/x")
-            assert exc_info.value.code == ERR_NO_DIRECT_URL
+                    url, sniff_info = await d._resolve_direct_url(
+                        "https://www.example.com/x"
+                    )
+            assert url == "https://www.example.com/x"
+            assert sniff_info is None
 
 
 # ===== download_async 端到端（探嗅集成）=====

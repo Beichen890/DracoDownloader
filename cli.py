@@ -69,52 +69,53 @@ def verify_file(path: str, algorithm: str = "sha256") -> str:
 
 
 async def main_async(args):
-    downloader = DracoDownloader(
+    async with DracoDownloader(
         auto_optimize=args.optimize,
         auto_mirror=args.mirror,
         mirror_region=args.mirror_region,
-    )
+    ) as downloader:
 
-    if args.list_protocols:
-        print("支持的协议:")
-        for p in downloader.list_protocols():
-            print(f"  - {p}")
-        return
+        if args.list_protocols:
+            print("支持的协议:")
+            for p in downloader.list_protocols():
+                print(f"  - {p}")
+            return
 
-    # --dry-run 模式：只展示优化/镜像信息，不实际下载
-    if args.dry_run and args.url:
-        print(f"🔍 预分析: {args.url}")
+        # --dry-run 模式：只展示优化/镜像信息，不实际下载
+        if args.dry_run and args.url:
+            print(f"🔍 预分析: {args.url}")
+            print(f"📁 输出: {args.output}")
+            print(f"⚙️  自动优化: {'开启' if args.optimize else '关闭'}")
+            print(f"🦮 自动镜像: {'开启' if args.mirror else '关闭'} (区域: {args.mirror_region})")
+
+            if args.optimize:
+                print("\n📊 正在探测网络条件并计算最优参数...")
+                try:
+                    params = await downloader.optimize_url(args.url)
+                    print(f"  ✅ 最优分片数: {params.shard_count}")
+                    print(f"  ✅ 最优线程数: {params.thread_count}")
+                    print(f"  ✅ 分片大小: {params.chunk_size / 1024 / 1024:.1f} MB")
+                    print(f"  ✅ 最大连接数: {params.max_connections}")
+                    print(f"  ✅ 估计速度: {params.estimated_speed_mbps:.1f} Mbps")
+                    print(f"  🎯 说明: {params.rationale}")
+                except Exception as e:
+                    print(f"  ⚠️ 优化失败: {e}")
+            return
+
+        print(f"📥 下载: {args.url}")
         print(f"📁 输出: {args.output}")
-        print(f"⚙️  自动优化: {'开启' if args.optimize else '关闭'}")
-        print(f"🦮 自动镜像: {'开启' if args.mirror else '关闭'} (区域: {args.mirror_region})")
-
+        if args.mirror:
+            print(f"🦮 自动镜像: 开启 (区域: {args.mirror_region})")
         if args.optimize:
-            print("\n📊 正在探测网络条件并计算最优参数...")
-            try:
-                params = await downloader.optimize_url(args.url)
-                print(f"  ✅ 最优分片数: {params.shard_count}")
-                print(f"  ✅ 最优线程数: {params.thread_count}")
-                print(f"  ✅ 分片大小: {params.chunk_size / 1024 / 1024:.1f} MB")
-                print(f"  ✅ 最大连接数: {params.max_connections}")
-                print(f"  ✅ 估计速度: {params.estimated_speed_mbps:.1f} Mbps")
-                print(f"  🎯 说明: {params.rationale}")
-            except Exception as e:
-                print(f"  ⚠️ 优化失败: {e}")
-        return
+            print(f"⚙️  自动优化: 开启")
 
-    print(f"📥 下载: {args.url}")
-    print(f"📁 输出: {args.output}")
-    if args.mirror:
-        print(f"🦮 自动镜像: 开启 (区域: {args.mirror_region})")
-    if args.optimize:
-        print(f"⚙️  自动优化: 开启")
-
-    result = await downloader.download_async(
-        url=args.url,
-        output_path=args.output,
-        proxy=args.proxy,
-        callback=progress_callback
-    )
+        result = await downloader.download_async(
+            url=args.url,
+            output_path=args.output,
+            proxy=args.proxy,
+            timeout=args.timeout,
+            callback=progress_callback
+        )
 
     print()
     if result.success:

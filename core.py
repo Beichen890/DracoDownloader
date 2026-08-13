@@ -312,14 +312,20 @@ class DracoDownloader:
                 hint="探嗅阶段被拦截，尝试换 UA/加 cookie/换代理"
             ) from e
         except Exception as e:
-            raise sniff_failed_error(str(e)) from e
+            # 探嗅本身出错（网络/反爬等）：回退到当作直链直接下载
+            # 避免对 .bin 等无约定后缀、或临时网络问题导致整个下载失败
+            log.warning(f"探嗅失败，回退为直接下载: {e}")
+            return url, None
 
         if not result.direct_urls:
-            raise no_direct_url_error(url)
+            # 探嗅无结果：回退到直接下载（URL 可能是不带可识别后缀的直链）
+            log.warning(f"探嗅无结果，回退为直接下载: {url}")
+            return url, None
 
         best = result.best
         if best is None:
-            raise no_direct_url_error(url)
+            log.warning(f"探嗅无最佳候选，回退为直接下载: {url}")
+            return url, None
 
         log.info(f"探嗅命中: {best.url} (type={best.type.value}, "
                  f"source={best.source}, conf={best.confidence:.2f})")
