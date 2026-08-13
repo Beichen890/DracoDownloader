@@ -1,0 +1,45 @@
+{
+  "_comment": "风险规则表。等级从高到低: critical > danger > caution。匹配取最高等级。用户可通过 ~/.opendracocli/rules.json 覆盖扩展。字段: args_contain(子串匹配, 任一命中即匹配), exact_args(精确匹配, 全部必须存在), 两者可组合(AND)。",
+  "critical": {
+    "patterns": [
+      {"cmd": "rm", "args_contain": ["-rf"], "exact_args": ["/"], "desc": "递归强删根目录"},
+      {"cmd": "rm", "args_contain": ["-fr"], "exact_args": ["/"], "desc": "递归强删根目录"},
+      {"cmd": "rm", "exact_args": ["/"], "desc": "删除根目录"},
+      {"cmd": "mkfs", "desc": "格式化文件系统"},
+      {"cmd": "dd", "args_contain": ["of=/dev/"], "desc": "写裸设备"},
+      {"cmd": "shutdown", "desc": "关机"},
+      {"cmd": "reboot", "desc": "重启"},
+      {"cmd": "halt", "desc": "停机"},
+      {"cmd": "init", "exact_args": ["0"], "desc": "关机"}
+    ]
+  },
+  "danger": {
+    "patterns": [
+      {"cmd": "rm", "args_contain": ["-rf"], "desc": "递归强删"},
+      {"cmd": "rm", "args_contain": ["-fr"], "desc": "递归强删"},
+      {"cmd": "rmdir", "args_contain": ["/s"], "desc": "Windows 递归删目录"},
+      {"cmd": "rd", "args_contain": ["/s"], "desc": "Windows 递归删目录"},
+      {"cmd": "format", "desc": "格式化"},
+      {"cmd": "chmod", "args_contain": ["777"], "desc": "全权限"},
+      {"cmd": "chown", "desc": "改所有者"},
+      {"cmd": "kill", "args_contain": ["-9"], "desc": "强杀进程"},
+      {"cmd": "kill", "args_contain": ["-KILL"], "desc": "强杀进程"},
+      {"cmd": "taskkill", "args_contain": ["/f"], "desc": "Windows 强杀"},
+      {"cmd": "killall", "desc": "按名杀进程"}
+    ]
+  },
+  "caution": {
+    "patterns": [
+      {"cmd": "rm", "desc": "删除文件"},
+      {"cmd": "del", "desc": "删除文件"},
+      {"cmd": "mv", "desc": "移动/覆盖"},
+      {"cmd": "move", "desc": "移动/覆盖"},
+      {"cmd": "kill", "desc": "杀进程"},
+      {"cmd": "taskkill", "desc": "杀进程"},
+      {"cmd": "cp", "args_contain": ["-f"], "desc": "强制覆盖复制"},
+      {"cmd": "copy", "args_contain": ["/y"], "desc": "Windows 强制覆盖"},
+      {"cmd": "truncate", "desc": "截断文件"},
+      {"cmd": "chmod", "desc": "改权限"}
+    ]
+  }
+}

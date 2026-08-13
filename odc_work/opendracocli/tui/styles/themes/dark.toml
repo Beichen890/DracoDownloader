@@ -1,0 +1,29 @@
+# OpenDracoCLI 通用深色主题 (VS Code Dark+ 风格)
+name = "dark"
+
+[tokens]
+bg = "#1e1e1e"
+fg = "#d4d4d4"
+accent = "#569cd6"
+error = "#f44747"
+warn = "#cca700"
+info = "#4ec9b0"
+muted = "#808080"
+
+[terminal_16]
+black = "#1e1e1e"
+red = "#f44747"
+green = "#6a9955"
+yellow = "#d7ba7d"
+blue = "#569cd6"
+magenta = "#c586c0"
+cyan = "#4ec9b0"
+white = "#d4d4d4"
+bright_black = "#808080"
+bright_red = "#f48771"
+bright_green = "#89d185"
+bright_yellow = "#e2e210"
+bright_blue = "#75beff"
+bright_magenta = "#d670d6"
+bright_cyan = "#9cdcfe"
+bright_white = "#ffffff"

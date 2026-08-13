@@ -1,0 +1,29 @@
+# OpenDracoCLI 浅色主题 (GitHub Light 风格)
+name = "light"
+
+[tokens]
+bg = "#ffffff"
+fg = "#24292e"
+accent = "#0366d6"
+error = "#cb2431"
+warn = "#bf8800"
+info = "#0598bc"
+muted = "#6a737d"
+
+[terminal_16]
+black = "#24292e"
+red = "#cb2431"
+green = "#28a745"
+yellow = "#dbab09"
+blue = "#0366d6"
+magenta = "#5a32a3"
+cyan = "#0598bc"
+white = "#6a737d"
+bright_black = "#959da5"
+bright_red = "#d73a49"
+bright_green = "#34d058"
+bright_yellow = "#e2c60d"
+bright_blue = "#2188ff"
+bright_magenta = "#8445f2"
+bright_cyan = "#39c5cf"
+bright_white = "#ffffff"

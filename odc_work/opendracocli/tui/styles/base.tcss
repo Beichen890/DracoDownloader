@@ -1,0 +1,76 @@
+/* OpenDracoCLI textual 基础布局 CSS (P5)
+ *
+ * 不依赖主题色: 仅用 textual 内置 design tokens ($boost 等)，
+ * 以及由主题 CSS 覆盖的 $background / $color。
+ * 主题 CSS (由 ThemeProvider.generate_css 生成) 会与本文件一起加载，
+ * 覆盖颜色 token；本文件负责纯布局比例。
+ *
+ * 布局结构 (grid):
+ *   ┌──────────────────────────────────────┐
+ *   │  #input-panel          (高 3)        │  顶部输入
+ *   ├───────────────────────┬──────────────┤
+ *   │  #output-panel        │ #history-     │  主区
+ *   │  (3fr)                │ sidebar(1fr)  │  (左输出 + 右历史, 可隐藏)
+ *   ├───────────────────────┴──────────────┤
+ *   │  #status-bar           (高 1)        │  底部状态
+ *   └──────────────────────────────────────┘
+ */
+
+Screen {
+    layout: grid;
+    grid-size: 1 3;
+    grid-columns: 1fr;
+    grid-rows: 3 1fr 1;
+    background: $background;
+    color: $foreground;
+}
+
+/* 顶部输入面板: 固定高 3 */
+#input-panel {
+    column-span: 1;
+    row-span: 1;
+    height: 3;
+    border: tall $boost;
+    border-title-color: $text;
+    padding: 0 1;
+}
+
+/* 主内容区: 左输出 (3fr) + 右历史侧栏 (1fr) */
+#main {
+    layout: grid;
+    grid-size: 2 1;
+    grid-columns: 3fr 1fr;
+    grid-rows: 1fr;
+    height: 1fr;
+}
+
+/* 左侧输出面板 */
+#output-panel {
+    column-span: 1;
+    row-span: 1;
+    border: tall $boost;
+    border-title-color: $text;
+    padding: 0 1;
+}
+
+/* 右侧历史侧栏: 可隐藏 (app 给 widget 加 .hidden 类即折叠) */
+#history-sidebar {
+    column-span: 1;
+    row-span: 1;
+    border: tall $boost;
+    border-title-color: $text;
+    padding: 0 1;
+}
+
+#history-sidebar.hidden {
+    display: none;
+}
+
+/* 底部状态栏: 固定高 1 */
+#status-bar {
+    column-span: 1;
+    row-span: 1;
+    height: 1;
+    border: tall $boost;
+    padding: 0 1;
+}
