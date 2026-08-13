@@ -39,6 +39,7 @@ class AgentContext:
         config: Optional[DracoConfig] = None,
         log_sink: Optional[Callable[[str], None]] = None,
         session_id: str = "",
+        stdin: Optional[str] = None,
     ) -> None:
         # shell_runner: async callable (cmd: str) -> PipelineResult
         self._shell_runner = shell_runner
@@ -47,6 +48,10 @@ class AgentContext:
         self._config = config
         self._log_sink = log_sink
         self._session_id = session_id
+        self._stdin = stdin
+        # 函数可显式设置的退出码（None=默认 0）
+        # 用于 fgrep 等"命令式"函数对齐 GNU 退出码约定（0=有匹配，1=无匹配）
+        self._exit_code: Optional[int] = None
 
     @property
     def env(self) -> Dict[str, str]:
@@ -67,6 +72,21 @@ class AgentContext:
     def session_id(self) -> str:
         """当前会话 ID"""
         return self._session_id
+
+    @property
+    def stdin(self) -> Optional[str]:
+        """上游管道传入的 stdin（无上游则为 None）"""
+        return self._stdin
+
+    @property
+    def exit_code(self) -> Optional[int]:
+        """函数显式设置的退出码（None=未设置，默认 0）"""
+        return self._exit_code
+
+    @exit_code.setter
+    def exit_code(self, value: Optional[int]) -> None:
+        """设置退出码（用于 fgrep 等"命令式"函数对齐 GNU 退出码）"""
+        self._exit_code = value
 
     async def shell(self, cmd: str) -> Dict[str, Any]:
         """调 shell 通道（复用 P1 管线 + P2 风控 + P3 AI）

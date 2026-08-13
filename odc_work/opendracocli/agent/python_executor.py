@@ -83,6 +83,7 @@ class PythonChannelExecutor:
         cwd: Optional[str] = None,
         session_id: str = "",
         timeout: Optional[float] = None,
+        stdin: Optional[str] = None,
     ) -> AgentExecResult:
         """执行一个已注册的函数
 
@@ -93,6 +94,7 @@ class PythonChannelExecutor:
             cwd: 工作目录
             session_id: 会话 ID
             timeout: 超时秒数
+            stdin: 上游管道传入的 stdin（无上游为 None）
 
         Returns:
             AgentExecResult
@@ -128,6 +130,7 @@ class PythonChannelExecutor:
             config=self._config,
             log_sink=lambda msg: log.info("[func:%s] %s", func_name, msg),
             session_id=session_id,
+            stdin=stdin,
         )
 
         # 捕获 stdout
@@ -165,6 +168,10 @@ class PythonChannelExecutor:
             result.success = True
             result.exit_code = 0
             result.return_value = ret
+            # 函数可通过 ctx.exit_code 显式设置退出码（对齐 GNU grep 等约定）
+            ctx_exit = getattr(ctx, "exit_code", None)
+            if ctx_exit is not None:
+                result.exit_code = ctx_exit
 
         except asyncio.TimeoutError:
             result.exit_code = None

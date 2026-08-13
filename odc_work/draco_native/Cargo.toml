@@ -1,0 +1,21 @@
+[package]
+name = "draco_native"
+version = "0.1.0"
+edition = "2021"
+description = "OpenDracoCLI 原生内核 — Rust 实现的高频/IO 密集型命令"
+license = "MIT"
+
+[lib]
+name = "_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+# abi3-py310: 稳定 ABI，一个 wheel 跨 Python 3.10+，无需每版本单独编译
+pyo3 = { version = "0.23", features = ["abi3-py310", "extension-module"] }
+# 内存映射大文件读取（社区标准，替代手写 read）
+memmap2 = "0.9"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

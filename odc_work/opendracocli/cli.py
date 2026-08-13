@@ -53,9 +53,9 @@ from .shell.pipeline import ShellPipeline
 log = get_logger("cli")
 
 
-def _get_prompt_text() -> str:
+def _get_prompt_text(cwd: Optional[str] = None) -> str:
     """生成提示符（含 cwd）"""
-    cwd = os.getcwd()
+    cwd = cwd or os.getcwd()
     # 缩短 home 路径
     home = os.path.expanduser("~")
     if cwd.startswith(home):
@@ -138,6 +138,8 @@ class OpenDracoCLI:
 
         self._session_id = str(uuid.uuid4())
         self._running = False
+        # session cwd：cd 命令返回 new_cwd，更新此值并传给 pipeline（持久化）
+        self._session_cwd = os.getcwd()
 
     def _setup_draco_funcs(self) -> None:
         """注册 Draco 内置函数并接入 pipeline
@@ -291,7 +293,7 @@ class OpenDracoCLI:
 
     async def _shell_runner_for_agent(self, cmd: str):
         """AgentContext.shell 的 runner — 调 ShellPipeline（含 P2 风控 + P3 AI）"""
-        return await self._pipeline.run(cmd, session_id=self._session_id)
+        return await self._pipeline.run(cmd, session_id=self._session_id, cwd=self._session_cwd)
 
     async def run(self) -> None:
         """启动 TUI 主循环"""
@@ -363,10 +365,10 @@ class OpenDracoCLI:
         while self._running:
             try:
                 if self._pt_available:
-                    text = await session.prompt_async(_get_prompt_text())
+                    text = await session.prompt_async(_get_prompt_text(self._session_cwd))
                 else:
                     # 回退到 input()
-                    text = input(_get_prompt_text())
+                    text = input(_get_prompt_text(self._session_cwd))
             except (EOFError, KeyboardInterrupt):
                 # Ctrl+D / Ctrl+C 退出
                 print()
@@ -417,7 +419,7 @@ class OpenDracoCLI:
         """走 shell 通道（P1-P3 管线）"""
         try:
             result = await self._pipeline.run(
-                text, session_id=self._session_id
+                text, session_id=self._session_id, cwd=self._session_cwd
             )
         except Exception as e:
             log.exception("pipeline crashed")
@@ -431,6 +433,10 @@ class OpenDracoCLI:
         if not result.success and result.error is not None:
             self._render_draco_error(result.error)
             return
+
+        # cd 等命令更新 session cwd（持久化，后续命令用新目录）
+        if result.new_cwd:
+            self._session_cwd = result.new_cwd
 
         # 渲染 stdout/stderr
         if result.stdout:

@@ -35,7 +35,8 @@ class ExecResult:
         stderr: 完整 stderr
         mapped_command: 最终交给 shell 的命令字符串
         duration_ms: 耗时（毫秒）
-        cancelled: 是否被用户取消
+        cancelled: 是否被取消
+        new_cwd: cd 等命令返回的新工作目录（绝对路径）；None 表示不变
     """
 
     exit_code: Optional[int]
@@ -44,6 +45,7 @@ class ExecResult:
     mapped_command: str = ""
     duration_ms: int = 0
     cancelled: bool = False
+    new_cwd: Optional[str] = None
 
 
 class Executor(Protocol):

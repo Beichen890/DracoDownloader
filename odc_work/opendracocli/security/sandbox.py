@@ -42,25 +42,31 @@ class SandboxExecutor:
         timeout: Optional[float] = None,
     ) -> ExecResult:
         """执行前检查路径，通过则交给 inner executor"""
-        # 提取所有可能被写入的路径
-        write_paths = self._extract_write_paths(ir, cwd)
+        violation = self.check(ir, cwd)
+        if violation is not None:
+            log.warning(violation)
+            return ExecResult(
+                exit_code=-1,
+                stderr=violation,
+                mapped_command=serialize_ir(ir),
+                duration_ms=0,
+            )
+        # 路径检查通过，交给 inner
+        return await self._inner.execute(ir, cwd=cwd, timeout=timeout)
 
-        for p in write_paths:
+    def check(self, ir: CommandIR, cwd: Optional[str]) -> Optional[str]:
+        """检查 IR 是否违反写白名单
+
+        Returns:
+            违规错误消息；None 表示通过
+        """
+        for p in self._extract_write_paths(ir, cwd):
             if not self._is_writable(p):
-                msg = (
+                return (
                     f"draco.sandbox.violation: 写入路径 {p} 不在白名单内 "
                     f"(白名单: {self._writable})"
                 )
-                log.warning(msg)
-                return ExecResult(
-                    exit_code=-1,
-                    stderr=msg,
-                    mapped_command=serialize_ir(ir),
-                    duration_ms=0,
-                )
-
-        # 路径检查通过，交给 inner
-        return await self._inner.execute(ir, cwd=cwd, timeout=timeout)
+        return None
 
     def _extract_write_paths(
         self, ir: CommandIR, cwd: Optional[str]

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from . import file_ops, net_ops
+from . import archive_ops, file_ops, net_ops, text_ops
 
 if TYPE_CHECKING:
     from ..agent.function_registry import FunctionRegistry
@@ -30,6 +30,14 @@ def register_builtins(registry: "FunctionRegistry") -> int:
         count += 1
     # 网络操作
     for func in (net_ops.pcheck, net_ops.http, net_ops.dns):
+        registry.register(func.__name__, func, builtin=True)
+        count += 1
+    # 归档操作（tar/zip）
+    for func in (archive_ops.ftar, archive_ops.fzip):
+        registry.register(func.__name__, func, builtin=True)
+        count += 1
+    # 文本操作（grep/hash/json）
+    for func in (text_ops.fgrep, text_ops.fhash, text_ops.fjson):
         registry.register(func.__name__, func, builtin=True)
         count += 1
     return count

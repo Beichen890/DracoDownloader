@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=68.0"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
 
 [project]
 name = "opendracocli"
@@ -40,16 +40,20 @@ test = [
 [project.scripts]
 opendracocli = "opendracocli.cli:main"
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["opendracocli*"]
-
-[tool.setuptools.package-data]
-"opendracocli.mappings" = ["*.json"]
-"opendracocli.security" = ["*.json"]
-"opendracocli.ai.roles" = ["*.json"]
-"opendracocli.tui.styles" = ["**/*.tcss", "**/*.toml"]
-"opendracocli.tui.styles.themes" = ["*.toml"]
+[tool.maturin]
+# Python 源码根目录（opendracocli 包在此下）
+python-source = "."
+# 编译产出嵌入为 opendracocli._native 扩展模块
+module-name = "opendracocli._native"
+features = ["pyo3/extension-module"]
+manifest-path = "draco_native/Cargo.toml"
+# 包内数据文件（.json/.tcss/.toml）随包发布
+include = [
+    { path = "opendracocli/security/*.json", format = "wheel" },
+    { path = "opendracocli/ai/roles/*.json", format = "wheel" },
+    { path = "opendracocli/tui/styles/**/*.tcss", format = "wheel" },
+    { path = "opendracocli/tui/styles/**/*.toml", format = "wheel" },
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -90,20 +90,25 @@ def split_kv(tokens: List[str]) -> ParsedArgs:
 
 
 def _convert_value(value: str, type_hint: Any) -> Any:
-    """根据 type hint 转换字符串值"""
-    if type_hint is bool:
+    """根据 type hint 转换字符串值
+
+    支持 type 对象（bool/int/float）和字符串形式（'bool'/'int'/'float'），
+    后者出现在 `from __future__ import annotations` 模块中（注解被惰性化为字符串）。
+    """
+    name = type_hint if isinstance(type_hint, str) else getattr(type_hint, "__name__", "")
+    if name == "bool":
         low = value.strip().lower()
         if low in ("true", "1", "yes", "on"):
             return True
         if low in ("false", "0", "no", "off", ""):
             return False
         raise ArgParseError(f"无法把 '{value}' 转换为 bool")
-    if type_hint is int:
+    if name == "int":
         try:
             return int(value)
         except ValueError:
             raise ArgParseError(f"无法把 '{value}' 转换为 int")
-    if type_hint is float:
+    if name == "float":
         try:
             return float(value)
         except ValueError:
