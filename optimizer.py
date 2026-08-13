@@ -48,8 +48,8 @@ class BandwidthProbe:
         profile = await probe.measure(url)
     """
 
-    def __init__(self, probe_size: int = 5 * 1024 * 1024,  # 5MB测速文件
-                 probe_timeout: float = 15.0,
+    def __init__(self, probe_size: int = 10 * 1024 * 1024,  # 10MB测速文件
+                 probe_timeout: float = 25.0,
                  min_download: int = 256 * 1024):  # 最少256KB
         self.probe_size = probe_size
         self.probe_timeout = probe_timeout
@@ -91,27 +91,68 @@ class BandwidthProbe:
                     profile.latency_ms = sum(latency_samples) / len(latency_samples)
 
                 # 阶段2: 带宽测量（下载测速文件）
+                # 6s 取样窗口：TCP slow start 在前 1-2s 未充分跑满，
+                # 3s 采样会低估带宽（实测 179Mbps 被测成 100Mbps，低估 52%）
                 bw_start = time.time()
                 downloaded = 0
+                # 取窗口后 4s 的稳态速度（丢弃前 2s slow start 段）
+                warmup_s = 2.0
+                total_s = 6.0
+                warmup_bytes = 0
+                steady_start = None
 
                 async with session.get(url) as resp:
                     if resp.status == 200:
                         async for chunk in resp.content.iter_chunked(64 * 1024):
                             downloaded += len(chunk)
                             elapsed = time.time() - bw_start
-                            if elapsed >= 3.0 or downloaded >= self.probe_size:
+                            if elapsed >= warmup_s and steady_start is None:
+                                # warmup 结束，开始稳态采样
+                                steady_start = time.time()
+                                warmup_bytes = downloaded
+                            if elapsed >= total_s or downloaded >= self.probe_size:
                                 break
 
                 elapsed = time.time() - bw_start
                 if elapsed > 0 and downloaded >= self.min_download:
-                    profile.download_speed_bps = int(downloaded * 8 / elapsed)
-                    profile.bandwidth_mbps = (downloaded * 8) / (elapsed * 1_000_000)
+                    # 优先用稳态段（warmup 后）计算带宽，避免 slow start 低估
+                    steady_elapsed = None
+                    steady_bytes = 0
+                    if steady_start is not None:
+                        steady_elapsed = time.time() - steady_start
+                        steady_bytes = downloaded - warmup_bytes
+                        if steady_elapsed > 0.5 and steady_bytes > 0:
+                            profile.download_speed_bps = int(
+                                steady_bytes * 8 / steady_elapsed
+                            )
+                            profile.bandwidth_mbps = (
+                                steady_bytes * 8 / (steady_elapsed * 1_000_000)
+                            )
+                        else:
+                            # 稳态段太短，退回全程
+                            profile.download_speed_bps = int(downloaded * 8 / elapsed)
+                            profile.bandwidth_mbps = (
+                                downloaded * 8 / (elapsed * 1_000_000)
+                            )
+                    else:
+                        # 未到 warmup 就下完了（小文件），用全程
+                        profile.download_speed_bps = int(downloaded * 8 / elapsed)
+                        profile.bandwidth_mbps = (
+                            downloaded * 8 / (elapsed * 1_000_000)
+                        )
                     profile.bandwidth_confidence = min(
                         1.0,
                         max(0.3, downloaded / self.probe_size)
                     )
-                    log.info(f"带宽测量: {downloaded/1024/1024:.1f}MB in {elapsed:.1f}s, "
-                             f"= {profile.bandwidth_mbps:.1f} Mbps")
+                    if steady_elapsed is not None:
+                        log.info(f"带宽测量: {downloaded/1024/1024:.1f}MB in {elapsed:.1f}s"
+                                 f" (稳态段 {steady_elapsed:.1f}s"
+                                 f" {steady_bytes/1024/1024:.1f}MB), "
+                                 f"= {profile.bandwidth_mbps:.1f} Mbps")
+                    else:
+                        log.info(f"带宽测量: {downloaded/1024/1024:.1f}MB in {elapsed:.1f}s"
+                                 f" (全程，未到 warmup), "
+                                 f"= {profile.bandwidth_mbps:.1f} Mbps")
                 else:
                     # 使用较保守的估计
                     profile.bandwidth_mbps = 50.0
@@ -429,12 +470,33 @@ class DownloadOptimizer:
         """
         # 探测网络状况
         if network_profile is None and self.auto_probe and url:
-            try:
-                profile = await self.bandwidth_probe.measure(url)
-                self._last_profile = profile
-            except Exception as e:
-                log.warning(f"网络探测失败: {e}")
-                profile = NetworkProfile()
+            # 优先用历史实际带宽（record_actual 回填，置信度高于短时探测）
+            # 仅当历史带宽存在且文件较大时跳过实时探测（小文件不值得多花 6s 探测）
+            historical = self.profile_for(url)
+            if historical is not None and file_size > 50 * 1024 * 1024:
+                profile = historical
+                log.info(f"使用历史带宽画像: {profile.bandwidth_mbps:.1f} Mbps "
+                         f"(host={self._host_of(url)})")
+            else:
+                try:
+                    profile = await self.bandwidth_probe.measure(url)
+                    self._last_profile = profile
+                    # 与历史带宽融合（历史可信度更高，权重 0.6）
+                    if historical is not None and historical.bandwidth_mbps > 0:
+                        fused = (0.4 * profile.bandwidth_mbps
+                                 + 0.6 * historical.bandwidth_mbps)
+                        profile.bandwidth_mbps = fused
+                        profile.download_speed_bps = int(fused * 1_000_000 / 8)
+                        log.info(f"带宽融合: 探测 {profile.bandwidth_mbps:.1f} + "
+                                 f"历史 {historical.bandwidth_mbps:.1f} "
+                                 f"→ {fused:.1f} Mbps")
+                except Exception as e:
+                    log.warning(f"网络探测失败: {e}")
+                    # 探测失败时退回历史画像，避免用默认 50Mbps
+                    if historical is not None:
+                        profile = historical
+                    else:
+                        profile = NetworkProfile()
         else:
             profile = network_profile or NetworkProfile()
 

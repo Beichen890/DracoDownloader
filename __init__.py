@@ -16,7 +16,6 @@ Features:
 
 from .core import DracoDownloader, DownloadResult, ProgressEvent
 from .scheduler import Scheduler
-from .engine import DownloadEngine
 from .progress import ProgressManager
 from .logger import get_logger
 from .errors import (
@@ -46,13 +45,12 @@ from .optimizer import (
     NetworkProfile, OptimalParams,
 )
 
-__version__ = "1.4.2"
+__version__ = "1.4.3"
 __all__ = [
     "DracoDownloader",
     "DownloadResult",
     "ProgressEvent",
     "Scheduler",
-    "DownloadEngine",
     "ProgressManager",
     "get_logger",
     # 错误目录

@@ -19,7 +19,7 @@ import argparse
 import hashlib
 from pathlib import Path
 
-from DracoDownloader import DracoDownloader
+from DracoDownloader import DracoDownloader, __version__
 
 
 def _format_speed(speed_bps: int) -> str:
@@ -165,9 +165,13 @@ def main():
                "  python -m DracoDownloader https://... -o file --verify sha256\n"
                "  python -m DracoDownloader https://... -o file --mirror --optimize\n"
                "  python -m DracoDownloader https://... -o file --dry-run --optimize\n"
+               "  python -m DracoDownloader -o file.zip -u https://example.com/file.zip\n"
     )
 
-    parser.add_argument("url", nargs="?", help="下载链接")
+    parser.add_argument("url_pos", nargs="?", metavar="URL",
+                        help="下载链接（位置参数，与 -u/--url 二选一）")
+    parser.add_argument("-u", "--url",
+                        help="下载链接（命名参数，支持 -o file -u URL 顺序）")
     parser.add_argument("-o", "--output", help="输出路径")
     parser.add_argument("-p", "--proxy", help="代理地址 (http://或socks5://)")
     parser.add_argument("-t", "--timeout", type=int, default=3600,
@@ -201,9 +205,12 @@ def main():
     parser.add_argument("--list-protocols", action="store_true",
                         help="列出支持的协议")
     parser.add_argument("-v", "--version", action="version",
-                        version=f"DracoDownloader 1.3.0")
+                        version=f"DracoDownloader {__version__}")
 
     args = parser.parse_args()
+
+    # 合并位置参数 URL 和 -u/--url（两者二选一，-u 优先）
+    args.url = args.url or args.url_pos
 
     # --list-protocols 不需要 url
     if args.list_protocols:

@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.4.3] - 2026-08-12
+
+### Fixed
+- **CLI 版本号一致性**: `--version` 从 `__version__` 读取，不再硬编码 1.3.0
+- **CLI URL 参数顺序**: 新增 `-u/--url` 命名参数，`-o file -u URL` 顺序可用（位置参数仍兼容）
+- **带宽探测低估**: 探测窗口 3s→6s + 丢弃前 2s TCP slow start 段 + probe_size 5MB→10MB；`optimize_for_url` 优先用历史 `profile_for` 实际带宽，并与实时探测融合（历史权重 0.6）
+- **断点保存间隔**: 自适应下载断点保存 2s→1s，崩溃最多丢 1s 进度
+
+### Removed
+- **DownloadEngine 死代码**: 删除 `engine.py` 及 `core.py`/`__init__.py` 中的引用（实例化后从未被下载流程使用）
+
 ## [1.4.2] - 2026-08-12
 
 ### Fixed
