@@ -13,7 +13,6 @@ from .protocols import ProtocolRouter
 from .protocols.base import DownloadHandle
 from .protocols.http import HTTPDriver
 from .scheduler import Scheduler
-from .engine import DownloadEngine
 from .progress import ProgressManager
 from .mirror_selector import (
     MirrorSelector, SmartMirrorDownloader,
@@ -89,7 +88,6 @@ class DracoDownloader:
                 默认 ~/.draco/auth/bilibili.json
         """
         self.scheduler = Scheduler(max_concurrent=max_concurrent)
-        self.engine = DownloadEngine()
         self.progress = ProgressManager()
         self.router = ProtocolRouter()
         self.auto_optimize = auto_optimize

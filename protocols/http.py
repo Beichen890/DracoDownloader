@@ -690,8 +690,8 @@ class HTTPDriver(ProtocolDriver):
                 _, idx = candidates.pop(0)
                 self._spawn_split_worker(state, idx)
 
-            # 定期保存断点
-            if loop_time - last_save > 2.0:
+            # 定期保存断点（1s 间隔，崩溃最多丢 1s 进度）
+            if loop_time - last_save > 1.0:
                 async with state['lock']:
                     self._save_adaptive_progress(
                         Path(state['progress_path']), ranges
