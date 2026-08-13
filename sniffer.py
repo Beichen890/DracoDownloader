@@ -111,6 +111,11 @@ _DIRECT_LINK_EXTENSIONS: Dict[str, ResourceType] = {
     # 镜像
     '.iso': ResourceType.BINARY,
     '.img': ResourceType.BINARY,
+    # 通用二进制（测速文件、固件、数据包等无后缀约定的二进制）
+    '.bin': ResourceType.BINARY,
+    '.dat': ResourceType.BINARY,
+    '.dump': ResourceType.BINARY,
+    '.flash': ResourceType.BINARY,
     # 图片
     '.png': ResourceType.IMAGE,
     '.jpg': ResourceType.IMAGE,

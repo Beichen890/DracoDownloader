@@ -74,6 +74,15 @@ class TestClassifyUrl:
         assert classify_url("https://example.com/disk.iso") == ResourceType.BINARY
         assert classify_url("https://example.com/app.AppImage") == ResourceType.BINARY
 
+    def test_generic_binary_extensions(self):
+        """通用二进制后缀（测速文件/固件/数据包等）"""
+        assert classify_url("https://speed.hetzner.de/100MB.bin") == ResourceType.BINARY
+        assert classify_url("https://example.com/firmware.dat") == ResourceType.BINARY
+        assert classify_url("https://example.com/core.dump") == ResourceType.BINARY
+        assert classify_url("https://example.com/rom.flash") == ResourceType.BINARY
+        # 带查询参数
+        assert classify_url("https://example.com/file.bin?token=abc") == ResourceType.BINARY
+
     def test_compression_variants(self):
         assert classify_url("https://example.com/x.tgz") == ResourceType.ARCHIVE
         assert classify_url("https://example.com/x.txz") == ResourceType.ARCHIVE
