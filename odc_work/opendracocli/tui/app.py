@@ -742,7 +742,6 @@ class DracoApp(App):
             ir = parse(command)
             normalize(ir)
             ir, _ = self._pipeline._expander.expand(ir)
-            self._pipeline._mapper.map(ir)
         except DracoError as e:
             out.write_error(e.code, e.message)
             return
